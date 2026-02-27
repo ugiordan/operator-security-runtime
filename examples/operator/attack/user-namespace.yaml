@@ -1,0 +1,36 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: user-project
+  labels:
+    purpose: attack-simulation
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: user-sa
+  namespace: user-project
+---
+# Simulates the operator ServiceAccount existing in user namespace.
+# In practice, operators that deploy components into user namespaces
+# often create their SA there, or users can create same-named SAs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-serviceaccount-hijacking-protection-controller-manager
+  namespace: user-project
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: user-edit
+  namespace: user-project
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit  # Standard Kubernetes 'edit' role
+subjects:
+- kind: ServiceAccount
+  name: user-sa
+  namespace: user-project

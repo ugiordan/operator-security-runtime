@@ -1,0 +1,7 @@
+apiVersion: app.example.com/v1alpha1
+kind: ExampleResource
+metadata:
+  name: workload-b
+  namespace: project-b
+spec:
+  foo: "demonstrates multi-namespace scoping"

@@ -1,0 +1,7 @@
+apiVersion: app.example.com/v1alpha1
+kind: ExampleResource
+metadata:
+  name: workload-a
+  namespace: project-a
+spec:
+  foo: "demonstrates dynamic RBAC scoping"

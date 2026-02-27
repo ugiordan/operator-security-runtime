@@ -1,0 +1,41 @@
+# ValidatingAdmissionPolicy to prevent non-system users from creating or
+# updating ClusterRoles/Roles that grant the 'impersonate' verb on
+# serviceaccounts.
+#
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
+# On OpenShift, available from OCP 4.17+.
+#
+# Deploy with:
+#   kubectl apply -f config/validatingadmissionpolicy/
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: deny-impersonate-grants
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["clusterroles", "roles"]
+        operations: ["CREATE", "UPDATE"]
+  matchConditions:
+    - name: not-control-plane-or-admin
+      expression: "!(request.userInfo.username.startsWith('system:kube-') || request.userInfo.groups.exists(g, g == 'system:masters'))"
+  validations:
+    - expression: |
+        !object.rules.exists(r,
+          r.verbs.exists(v, v == 'impersonate' || v == '*') &&
+          r.resources.exists(res, res == 'serviceaccounts' || res == '*')
+        )
+      message: "Granting 'impersonate' on serviceaccounts is restricted (including via wildcard verbs or resources). Contact your cluster admin."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: deny-impersonate-grants-binding
+spec:
+  policyName: deny-impersonate-grants
+  validationActions:
+    - Deny

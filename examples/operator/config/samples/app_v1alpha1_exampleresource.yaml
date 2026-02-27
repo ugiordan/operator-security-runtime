@@ -1,0 +1,9 @@
+apiVersion: app.example.com/v1alpha1
+kind: ExampleResource
+metadata:
+  labels:
+    app.kubernetes.io/name: k8s-serviceaccount-hijacking-protection
+    app.kubernetes.io/managed-by: kustomize
+  name: exampleresource-sample
+spec:
+  # TODO(user): Add fields here
