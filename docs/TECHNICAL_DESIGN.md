@@ -103,18 +103,17 @@ A defense-in-depth approach with three complementary mechanisms:
 
 ### Core Logic Flow
 
-```
-PodCreate/Update request arrives
-  |
-  +-- Is pod using a protected ServiceAccount?
-  |     |
-  |     NO --> Allow (not our concern)
-  |     |
-  |     YES --> Who is making this request?
-  |               |
-  |               +-- Creator == ServiceAccount's own identity? --> Allow
-  |               |
-  |               +-- Anyone else (users, admins, other SAs) --> Deny
+```mermaid
+flowchart TD
+    A[Pod CREATE / UPDATE request] --> B{Uses a protected ServiceAccount?}
+    B -- No --> C[Allow — not our concern]
+    B -- Yes --> D{Creator == SA's own identity?}
+    D -- Yes --> E[Allow]
+    D -- No --> F[Deny — users, admins, other SAs]
+
+    style C fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#e8f5e9,stroke:#4CAF50
+    style F fill:#ffebee,stroke:#f44336
 ```
 
 The webhook distinguishes two different identities in every pod creation:
@@ -211,33 +210,32 @@ The reconciler action chain during CR reconciliation:
 
 4. **Static ClusterRole** -- The operator's ClusterRole contains only RBAC management permissions (`create`, `delete`, `get` on Roles and RoleBindings). It has **no** scoped resource permissions. Resource access exists only in namespaces with active CRs.
 
-```
-CR Created in namespace "foo"
-  |
-  v
-EnsureAccess(ctx, cr)
-  |
-  +-- Create/Update Role "operator-scoped-access" in "foo"
-  |     Rules: configured PolicyRules
-  |     OwnerRef: -> CR
-  |
-  +-- Create/Update RoleBinding "operator-scoped-access-binding" in "foo"
-  |     Subject: operator SA
-  |     RoleRef: -> Role
-  |     OwnerRef: -> CR
-  |
-  v
-Operator can now access scoped resources in "foo"
-  |
-  ...
-  |
-CR Deleted from namespace "foo"
-  |
-  v
-CleanupAccess(ctx, cr)
-  |
-  +-- Remove OwnerRef from Role (delete if last owner)
-  +-- Remove OwnerRef from RoleBinding (delete if last owner)
+```mermaid
+flowchart TD
+    A[CR created in namespace foo] --> B[EnsureAccess]
+    B --> C["Create/Update Role\noperator-scoped-access\nRules: configured PolicyRules\nOwnerRef → CR"]
+    B --> D["Create/Update RoleBinding\noperator-scoped-access-binding\nSubject: operator SA\nOwnerRef → CR"]
+    C --> E[Operator can access scoped resources in foo]
+    D --> E
+    E -.- F[". . ."]
+    F --> G[CR deleted from namespace foo]
+    G --> H[CleanupAccess]
+    H --> I[Remove OwnerRef from Role]
+    H --> J[Remove OwnerRef from RoleBinding]
+    I --> K{Last owner?}
+    J --> L{Last owner?}
+    K -- Yes --> M[Delete Role]
+    K -- No --> N[Keep Role]
+    L -- Yes --> O[Delete RoleBinding]
+    L -- No --> P[Keep RoleBinding]
+
+    style A fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#e8f5e9,stroke:#4CAF50
+    style G fill:#fff3e0,stroke:#FF9800
+    style M fill:#ffebee,stroke:#f44336
+    style O fill:#ffebee,stroke:#f44336
+    style N fill:#e8f5e9,stroke:#4CAF50
+    style P fill:#e8f5e9,stroke:#4CAF50
 ```
 
 ### Multi-CR Ownership
@@ -337,21 +335,18 @@ ClusterRole and removes the `impersonate` verb from any rule targeting
 4. **Is idempotent** -- if the ClusterRole is already clean, the reconciler
    does nothing.
 
-```
-ClusterRole system:aggregate-to-edit changes
-  |
-  v
-Reconciler triggered
-  |
-  +-- Rules contain impersonate on serviceaccounts?
-  |     |
-  |     NO --> No-op (already clean)
-  |     |
-  |     YES --> Strip impersonate verb
-  |               |
-  |               +-- Set autoupdate=false annotation
-  |               +-- Update ClusterRole
-  |               +-- Log action
+```mermaid
+flowchart TD
+    A[ClusterRole system:aggregate-to-edit changes] --> B[Reconciler triggered]
+    B --> C{Rules contain impersonate\non serviceaccounts?}
+    C -- No --> D[No-op — already clean]
+    C -- Yes --> E[Strip impersonate verb]
+    E --> F["Set autoupdate=false annotation"]
+    E --> G[Update ClusterRole]
+    E --> H[Log action]
+
+    style D fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#fff3e0,stroke:#FF9800
 ```
 
 ### ValidatingAdmissionPolicy Companion

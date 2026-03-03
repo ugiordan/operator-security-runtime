@@ -354,6 +354,37 @@ Rules: []rbacv1.PolicyRule{
 }
 ```
 
+### Cross-Controller CRD Access
+
+The `Rules` field is not limited to core resources. If your controller needs
+scoped access to Custom Resources managed by a different controller, include
+the CRD's API group in the rules:
+
+```go
+Rules: []rbacv1.PolicyRule{
+    {
+        APIGroups: []string{""},
+        Resources: []string{"secrets"},
+        Verbs:     []string{"get", "list", "watch"},
+    },
+    {
+        APIGroups: []string{"mlflow.example.com"},
+        Resources: []string{"mlflowservers"},
+        Verbs:     []string{"get", "list", "watch"},
+    },
+}
+```
+
+When a FeatureStore CR is created in namespace X, the scoper grants the
+FeatureStore SA access to both secrets and MLFlow CRs in that namespace.
+This works when both CRs co-locate in the same namespace (the common pattern
+in multi-tenant platforms where users create all related CRs in their project
+namespace).
+
+**Limitation:** Access is scoped to namespaces where the triggering
+controller's own CRs exist. If the target CRs live in a different namespace,
+use a static ClusterRole for that cross-namespace access instead.
+
 ### Multiple ServiceAccounts
 
 If your operator deploys multiple components with separate ServiceAccounts,
