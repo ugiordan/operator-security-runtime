@@ -7,7 +7,9 @@ import (
 	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -267,4 +269,85 @@ func gcParseOwnerEntry(entry string) []string {
 // string.
 func gcJoinAnnotationEntries(entries []string) string {
 	return strings.Join(entries, ",")
+}
+
+// gcAnnotationOwnersShared is the shared GC logic for both RBACScoper and
+// ClusterRBACScoper. It parses annotation owner entries, resolves each via
+// the resolver, removes stale or malformed entries, and deletes the resource
+// if no owners remain. When checkOwnerRefs is true (namespace-scoped), both
+// OwnerReferences and annotation entries must be empty before deletion.
+// When false (cluster-scoped), only annotation entries are checked.
+func gcAnnotationOwnersShared(
+	ctx context.Context,
+	cl client.Client,
+	obj client.Object,
+	annotationKey string,
+	resolver OwnerResolver,
+	kind string,
+	checkOwnerRefs bool,
+) (removed int, deleted bool, err error) {
+	log := ctrl.LoggerFrom(ctx)
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return 0, false, nil
+	}
+	existing := annotations[annotationKey]
+	if existing == "" {
+		return 0, false, nil
+	}
+
+	entries := gcSplitAnnotationEntries(existing)
+	var validEntries []string
+	for _, entry := range entries {
+		parts := gcParseOwnerEntry(entry)
+		if parts == nil {
+			log.Info("removing malformed annotation entry", "entry", entry, "kind", kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
+			removed++
+			continue
+		}
+		ns, name, uid := parts[0], parts[1], types.UID(parts[2])
+		exists, resolveErr := resolver(ctx, ns, name, uid)
+		if resolveErr != nil {
+			return removed, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
+		}
+		if !exists {
+			log.Info("removing orphaned annotation entry", "entry", entry, "kind", kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
+			removed++
+			continue
+		}
+		validEntries = append(validEntries, entry)
+	}
+
+	if removed == 0 {
+		return 0, false, nil
+	}
+
+	// Update the annotation
+	if len(validEntries) == 0 {
+		delete(annotations, annotationKey)
+	} else {
+		annotations[annotationKey] = gcJoinAnnotationEntries(validEntries)
+	}
+	obj.SetAnnotations(annotations)
+
+	// Determine if any owners remain
+	hasAnnotationOwners := len(validEntries) > 0
+	hasOwnerRefs := checkOwnerRefs && len(obj.GetOwnerReferences()) > 0
+
+	if !hasOwnerRefs && !hasAnnotationOwners {
+		if delErr := cl.Delete(ctx, obj); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return removed, false, fmt.Errorf("deleting %s %s/%s: %w", kind, obj.GetNamespace(), obj.GetName(), delErr)
+		}
+		log.Info("deleted "+kind+" during GC (no owners remain)", "name", obj.GetName(), "namespace", obj.GetNamespace())
+		return removed, true, nil
+	}
+
+	if err := cl.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return removed, false, nil
+		}
+		return removed, false, fmt.Errorf("updating %s %s/%s during GC: %w", kind, obj.GetNamespace(), obj.GetName(), err)
+	}
+	log.Info("removed stale annotation entries from "+kind, "name", obj.GetName(), "namespace", obj.GetNamespace(), "removed", removed)
+	return removed, false, nil
 }

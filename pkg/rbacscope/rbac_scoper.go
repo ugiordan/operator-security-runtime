@@ -454,79 +454,15 @@ func (s *RBACScoper) GarbageCollectOrphanedOwners(
 	return result, nil
 }
 
-// gcAnnotationOwners parses annotation owner entries on obj, resolves each
-// via the resolver, removes stale or malformed entries, and deletes the
-// resource if no owners remain (no OwnerReferences AND no annotation entries).
+// gcAnnotationOwners delegates to the shared GC logic with checkOwnerRefs=true,
+// since namespace-scoped resources may have OwnerReferences.
 func (s *RBACScoper) gcAnnotationOwners(
 	ctx context.Context,
 	obj client.Object,
 	resolver OwnerResolver,
 	kind string,
 ) (removed int, deleted bool, err error) {
-	log := ctrl.LoggerFrom(ctx)
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		return 0, false, nil
-	}
-	existing := annotations[s.ownerTracker.annotationKey]
-	if existing == "" {
-		return 0, false, nil
-	}
-
-	entries := gcSplitAnnotationEntries(existing)
-	var validEntries []string
-	for _, entry := range entries {
-		parts := gcParseOwnerEntry(entry)
-		if parts == nil {
-			log.Info("removing malformed annotation entry", "entry", entry, "kind", kind, "namespace", obj.GetNamespace())
-			removed++
-			continue
-		}
-		ns, name, uid := parts[0], parts[1], types.UID(parts[2])
-		exists, resolveErr := resolver(ctx, ns, name, uid)
-		if resolveErr != nil {
-			return removed, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
-		}
-		if !exists {
-			log.Info("removing orphaned annotation entry", "entry", entry, "kind", kind, "namespace", obj.GetNamespace())
-			removed++
-			continue
-		}
-		validEntries = append(validEntries, entry)
-	}
-
-	if removed == 0 {
-		return 0, false, nil
-	}
-
-	// Update the annotation
-	if len(validEntries) == 0 {
-		delete(annotations, s.ownerTracker.annotationKey)
-	} else {
-		annotations[s.ownerTracker.annotationKey] = gcJoinAnnotationEntries(validEntries)
-	}
-	obj.SetAnnotations(annotations)
-
-	// Check if any owners remain
-	hasOwnerRefs := len(obj.GetOwnerReferences()) > 0
-	hasAnnotationOwners := len(validEntries) > 0
-
-	if !hasOwnerRefs && !hasAnnotationOwners {
-		if delErr := s.client.Delete(ctx, obj); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return removed, false, fmt.Errorf("deleting %s %s/%s: %w", kind, obj.GetNamespace(), obj.GetName(), delErr)
-		}
-		log.Info("deleted "+kind+" during GC (no owners remain)", "namespace", obj.GetNamespace())
-		return removed, true, nil
-	}
-
-	if err := s.client.Update(ctx, obj); err != nil {
-		if apierrors.IsNotFound(err) {
-			return removed, false, nil
-		}
-		return removed, false, fmt.Errorf("updating %s %s/%s during GC: %w", kind, obj.GetNamespace(), obj.GetName(), err)
-	}
-	log.Info("removed stale annotation entries from "+kind, "namespace", obj.GetNamespace(), "removed", removed)
-	return removed, false, nil
+	return gcAnnotationOwnersShared(ctx, s.client, obj, s.ownerTracker.annotationKey, resolver, kind, true)
 }
 
 // CleanupAllAccess removes the owner's references from all managed
