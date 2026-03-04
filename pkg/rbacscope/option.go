@@ -25,15 +25,21 @@ func defaultScopeConfig() scopeConfig {
 }
 
 // WithDeniedNamespaces replaces the default denied-namespace list.
+// At least one namespace must be provided; use this only when the defaults
+// are inappropriate for your environment.
 // This option only applies to RBACScoper (namespace-scoped grants);
 // it has no effect on ClusterRBACScoper which manages cluster-scoped resources.
 // WARNING: This removes built-in protections for kube-system, kube-public, etc.
 // Use WithAdditionalDeniedNamespaces to add namespaces without removing defaults.
 // Namespace entries ending with "-" are treated as prefix patterns
 // (e.g., "openshift-" matches all namespaces starting with "openshift-").
-func WithDeniedNamespaces(namespaces ...string) Option {
+//
+// Ordering note: if combined with WithAdditionalDeniedNamespaces, place
+// WithDeniedNamespaces first. WithDeniedNamespaces replaces the entire list,
+// so a later WithDeniedNamespaces discards any previously appended entries.
+func WithDeniedNamespaces(first string, rest ...string) Option {
 	return optionFunc(func(s *scopeConfig) {
-		s.deniedNamespaces = namespaces
+		s.deniedNamespaces = append([]string{first}, rest...)
 		s.deniedNamespacesModified = true
 	})
 }

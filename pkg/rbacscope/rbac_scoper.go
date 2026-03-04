@@ -48,7 +48,7 @@ func NewRBACScoper(
 	if err != nil {
 		return nil, err
 	}
-	if allowed.allowAll {
+	if allowed.deferToStatic {
 		ctrl.Log.Info("RBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
@@ -81,12 +81,16 @@ func (s *RBACScoper) labels() map[string]string {
 
 // EnsureAccess creates or updates a Role and RoleBinding in the owner's
 // namespace so that the operator ServiceAccount has the configured access there.
-// Note: DeniedNamespace checks are NOT applied here because the CR's
-// existence in its own namespace implies the operator has legitimate reasons
-// to access resources there. DeniedNamespace enforcement applies only to
-// cross-namespace grants via EnsureAccessInNamespace.
+//
+// DeniedNamespace checks are NOT applied here because the CR's existence
+// in its own namespace implies the operator has legitimate reasons to access
+// resources there. DeniedNamespace enforcement applies only to cross-namespace
+// grants via EnsureAccessInNamespace.
+//
+// IMPORTANT: This means a CR created in kube-system will grant access there.
+// Callers must ensure that CRD-level RBAC or admission policies prevent CR
+// creation in sensitive namespaces if that is undesirable.
 func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
-	log := ctrl.LoggerFrom(ctx)
 	ns := owner.GetNamespace()
 
 	if ns == "" {
@@ -101,12 +105,10 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 	if err := s.ensureRoleWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
 		return fmt.Errorf("ensuring Role in namespace %s: %w", ns, err)
 	}
-	log.Info("ensured Role", "namespace", ns, "role", s.roleName())
 
 	if err := s.ensureRoleBindingWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
 		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", ns, err)
 	}
-	log.Info("ensured RoleBinding", "namespace", ns, "roleBinding", s.roleBindingName())
 
 	return nil
 }
@@ -241,7 +243,7 @@ func (s *RBACScoper) cleanupOwnedResource(
 		return fmt.Errorf("getting %s %s: %w", kind, key, err)
 	}
 
-	s.removeOwnerRef(obj, owner)
+	removeOwnerRef(obj, owner)
 
 	// Check both ownership mechanisms: the resource might also have
 	// cross-namespace annotation owners from EnsureAccessInNamespace.
@@ -270,7 +272,7 @@ func (s *RBACScoper) cleanupOwnedResource(
 }
 
 // removeOwnerRef removes the OwnerReference matching the given owner from obj.
-func (s *RBACScoper) removeOwnerRef(obj client.Object, owner client.Object) {
+func removeOwnerRef(obj client.Object, owner client.Object) {
 	ownerUID := owner.GetUID()
 	refs := obj.GetOwnerReferences()
 	filtered := make([]metav1.OwnerReference, 0, len(refs))
@@ -345,8 +347,6 @@ func (s *RBACScoper) EnsureAccessInNamespace(
 	owner client.Object,
 	targetNS string,
 ) error {
-	log := ctrl.LoggerFrom(ctx)
-
 	if owner.GetNamespace() == "" {
 		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
@@ -375,12 +375,10 @@ func (s *RBACScoper) EnsureAccessInNamespace(
 	if err := s.ensureRoleWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
 		return fmt.Errorf("ensuring Role in namespace %s: %w", targetNS, err)
 	}
-	log.Info("ensured cross-namespace Role", "namespace", targetNS, "role", s.roleName())
 
 	if err := s.ensureRoleBindingWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
 		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", targetNS, err)
 	}
-	log.Info("ensured cross-namespace RoleBinding", "namespace", targetNS, "roleBinding", s.roleBindingName())
 
 	return nil
 }
@@ -396,88 +394,34 @@ func (s *RBACScoper) GarbageCollectOrphanedOwners(
 	ctx context.Context,
 	resolver OwnerResolver,
 ) (GCResult, error) {
+	if resolver == nil {
+		return GCResult{}, fmt.Errorf("resolver must not be nil")
+	}
+
 	var result GCResult
 
-	// GC Roles
-	roleList := &rbacv1.RoleList{}
-	listOpts := []client.ListOption{
-		client.MatchingLabels(s.labels()),
-		client.Limit(cleanupListPageSize),
-	}
-	for {
-		if err := s.client.List(ctx, roleList, listOpts...); err != nil {
-			return result, fmt.Errorf("listing managed Roles: %w", err)
+	gcFn := func(ctx context.Context, obj client.Object, kind string) error {
+		result.ResourcesScanned++
+		removed, deleted, err := gcAnnotationOwnersShared(
+			ctx, s.client, obj, s.ownerTracker.annotationKey, resolver, kind, true)
+		if err != nil {
+			return err
 		}
-		for i := range roleList.Items {
-			if roleList.Items[i].Name != s.roleName() {
-				continue
-			}
-			result.ResourcesScanned++
-			removed, deleted, err := s.gcAnnotationOwners(ctx, &roleList.Items[i], resolver, "Role")
-			if err != nil {
-				return result, err
-			}
-			result.EntriesRemoved += removed
-			if deleted {
-				result.ResourcesDeleted++
-			}
+		result.EntriesRemoved += removed
+		if deleted {
+			result.ResourcesDeleted++
 		}
-		if roleList.Continue == "" {
-			break
-		}
-		listOpts = []client.ListOption{
-			client.MatchingLabels(s.labels()),
-			client.Limit(cleanupListPageSize),
-			client.Continue(roleList.Continue),
-		}
+		return nil
 	}
 
-	// GC RoleBindings
-	rbList := &rbacv1.RoleBindingList{}
-	listOpts = []client.ListOption{
-		client.MatchingLabels(s.labels()),
-		client.Limit(cleanupListPageSize),
+	if err := s.forEachManagedRole(ctx, gcFn); err != nil {
+		return result, err
 	}
-	for {
-		if err := s.client.List(ctx, rbList, listOpts...); err != nil {
-			return result, fmt.Errorf("listing managed RoleBindings: %w", err)
-		}
-		for i := range rbList.Items {
-			if rbList.Items[i].Name != s.roleBindingName() {
-				continue
-			}
-			result.ResourcesScanned++
-			removed, deleted, err := s.gcAnnotationOwners(ctx, &rbList.Items[i], resolver, "RoleBinding")
-			if err != nil {
-				return result, err
-			}
-			result.EntriesRemoved += removed
-			if deleted {
-				result.ResourcesDeleted++
-			}
-		}
-		if rbList.Continue == "" {
-			break
-		}
-		listOpts = []client.ListOption{
-			client.MatchingLabels(s.labels()),
-			client.Limit(cleanupListPageSize),
-			client.Continue(rbList.Continue),
-		}
+	if err := s.forEachManagedRoleBinding(ctx, gcFn); err != nil {
+		return result, err
 	}
 
 	return result, nil
-}
-
-// gcAnnotationOwners delegates to the shared GC logic with checkOwnerRefs=true,
-// since namespace-scoped resources may have OwnerReferences.
-func (s *RBACScoper) gcAnnotationOwners(
-	ctx context.Context,
-	obj client.Object,
-	resolver OwnerResolver,
-	kind string,
-) (removed int, deleted bool, err error) {
-	return gcAnnotationOwnersShared(ctx, s.client, obj, s.ownerTracker.annotationKey, resolver, kind, true)
 }
 
 // CleanupAllAccess removes the owner's references from all managed
@@ -492,62 +436,83 @@ func (s *RBACScoper) CleanupAllAccess(ctx context.Context, owner client.Object) 
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
-	// Cleanup all managed Roles (paginated to limit API server load)
-	roleList := &rbacv1.RoleList{}
+	cleanupFn := func(ctx context.Context, obj client.Object, kind string) error {
+		return s.cleanupManagedResource(ctx, obj, owner, &s.ownerTracker, kind)
+	}
+
+	if err := s.forEachManagedRole(ctx, cleanupFn); err != nil {
+		return err
+	}
+	return s.forEachManagedRoleBinding(ctx, cleanupFn)
+}
+
+// forEachManagedRole iterates over all managed Roles (paginated) and calls fn
+// for each one matching this scoper's expected name.
+func (s *RBACScoper) forEachManagedRole(
+	ctx context.Context,
+	fn func(ctx context.Context, obj client.Object, kind string) error,
+) error {
+	list := &rbacv1.RoleList{}
 	listOpts := []client.ListOption{
 		client.MatchingLabels(s.labels()),
 		client.Limit(cleanupListPageSize),
 	}
 	for {
-		if err := s.client.List(ctx, roleList, listOpts...); err != nil {
+		if err := s.client.List(ctx, list, listOpts...); err != nil {
 			return fmt.Errorf("listing managed Roles: %w", err)
 		}
-		for i := range roleList.Items {
-			if roleList.Items[i].Name != s.roleName() {
+		for i := range list.Items {
+			if list.Items[i].Name != s.roleName() {
 				continue
 			}
-			if err := s.cleanupManagedResource(ctx, &roleList.Items[i], owner, &s.ownerTracker, "Role"); err != nil {
+			if err := fn(ctx, &list.Items[i], "Role"); err != nil {
 				return err
 			}
 		}
-		if roleList.Continue == "" {
+		if list.Continue == "" {
 			break
 		}
 		listOpts = []client.ListOption{
 			client.MatchingLabels(s.labels()),
 			client.Limit(cleanupListPageSize),
-			client.Continue(roleList.Continue),
+			client.Continue(list.Continue),
 		}
 	}
+	return nil
+}
 
-	// Cleanup all managed RoleBindings (paginated to limit API server load)
-	rbList := &rbacv1.RoleBindingList{}
-	listOpts = []client.ListOption{
+// forEachManagedRoleBinding iterates over all managed RoleBindings (paginated)
+// and calls fn for each one matching this scoper's expected name.
+func (s *RBACScoper) forEachManagedRoleBinding(
+	ctx context.Context,
+	fn func(ctx context.Context, obj client.Object, kind string) error,
+) error {
+	list := &rbacv1.RoleBindingList{}
+	listOpts := []client.ListOption{
 		client.MatchingLabels(s.labels()),
 		client.Limit(cleanupListPageSize),
 	}
 	for {
-		if err := s.client.List(ctx, rbList, listOpts...); err != nil {
+		if err := s.client.List(ctx, list, listOpts...); err != nil {
 			return fmt.Errorf("listing managed RoleBindings: %w", err)
 		}
-		for i := range rbList.Items {
-			if rbList.Items[i].Name != s.roleBindingName() {
+		for i := range list.Items {
+			if list.Items[i].Name != s.roleBindingName() {
 				continue
 			}
-			if err := s.cleanupManagedResource(ctx, &rbList.Items[i], owner, &s.ownerTracker, "RoleBinding"); err != nil {
+			if err := fn(ctx, &list.Items[i], "RoleBinding"); err != nil {
 				return err
 			}
 		}
-		if rbList.Continue == "" {
+		if list.Continue == "" {
 			break
 		}
 		listOpts = []client.ListOption{
 			client.MatchingLabels(s.labels()),
 			client.Limit(cleanupListPageSize),
-			client.Continue(rbList.Continue),
+			client.Continue(list.Continue),
 		}
 	}
-
 	return nil
 }
 
@@ -568,7 +533,7 @@ func (s *RBACScoper) cleanupManagedResource(
 	// Always try both ownership mechanisms: the resource might have been
 	// created via either EnsureAccess (OwnerReferences) or
 	// EnsureAccessInNamespace (annotations).
-	s.removeOwnerRef(obj, owner)
+	removeOwnerRef(obj, owner)
 	tracker.removeOwner(obj, owner)
 
 	// Check if any owners remain (either OwnerReferences or annotation entries)

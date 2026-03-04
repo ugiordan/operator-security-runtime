@@ -24,9 +24,6 @@ type ClusterRBACScoper struct {
 	operatorSAName      string
 	operatorSANamespace string
 	rules               []rbacv1.PolicyRule
-	// config holds scope options. Currently only used for forward compatibility;
-	// deniedNamespaces does not apply to cluster-scoped resources.
-	config              scopeConfig
 	ownerTracker        annotationOwnerTracker
 }
 
@@ -46,7 +43,7 @@ func NewClusterRBACScoper(
 	if err != nil {
 		return nil, err
 	}
-	if allowed.allowAll {
+	if allowed.deferToStatic {
 		ctrl.Log.Info("ClusterRBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
@@ -63,7 +60,6 @@ func NewClusterRBACScoper(
 		operatorSAName:      identity.ServiceAccount,
 		operatorSANamespace: identity.Namespace,
 		rules:               rules,
-		config:              cfg,
 		ownerTracker:        annotationOwnerTracker{annotationKey: ownerAnnotationKey},
 	}, nil
 }
@@ -87,8 +83,6 @@ func (s *ClusterRBACScoper) labels() map[string]string {
 // for the operator's ServiceAccount. Uses annotation-based ownership
 // (ClusterRoles are cluster-scoped, OwnerReferences require same-namespace).
 func (s *ClusterRBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
-	log := ctrl.LoggerFrom(ctx)
-
 	if owner.GetNamespace() == "" {
 		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
@@ -97,12 +91,10 @@ func (s *ClusterRBACScoper) EnsureAccess(ctx context.Context, owner client.Objec
 	if err := s.ensureClusterRoleWithOwnership(ctx, owner); err != nil {
 		return fmt.Errorf("ensuring ClusterRole: %w", err)
 	}
-	log.Info("ensured ClusterRole", "clusterRole", s.clusterRoleName())
 
 	if err := s.ensureClusterRoleBindingWithOwnership(ctx, owner); err != nil {
 		return fmt.Errorf("ensuring ClusterRoleBinding: %w", err)
 	}
-	log.Info("ensured ClusterRoleBinding", "clusterRoleBinding", s.clusterRoleBindingName())
 
 	return nil
 }
@@ -264,6 +256,10 @@ func (s *ClusterRBACScoper) GarbageCollectOrphanedOwners(
 	ctx context.Context,
 	resolver OwnerResolver,
 ) (GCResult, error) {
+	if resolver == nil {
+		return GCResult{}, fmt.Errorf("resolver must not be nil")
+	}
+
 	var result GCResult
 
 	// GC ClusterRole

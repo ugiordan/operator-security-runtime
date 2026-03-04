@@ -20,8 +20,8 @@ type OperatorIdentity struct {
 // allowed to grant. Use NewAllowedRules to create an instance with
 // explicit rules, or DeferToStaticRBAC to bypass ceiling enforcement.
 type AllowedRules struct {
-	rules    []rbacv1.PolicyRule
-	allowAll bool
+	rules          []rbacv1.PolicyRule
+	deferToStatic  bool // bypass ceiling enforcement; see DeferToStaticRBAC()
 }
 
 // NewAllowedRules creates an AllowedRules from one or more PolicyRules.
@@ -42,8 +42,12 @@ func NewAllowedRules(rules ...rbacv1.PolicyRule) (AllowedRules, error) {
 // cleanup), but they will contain zero rules — granting no additional
 // permissions. Use this when the operator's static ClusterRole already
 // constrains access appropriately and dynamic rule scoping is not needed.
+//
+// The empty Roles are necessary for ownership tracking (OwnerReferences and
+// annotation-based ownership) and are reset to zero rules on every reconcile
+// via CreateOrUpdate, limiting any external modification window.
 func DeferToStaticRBAC() AllowedRules {
-	return AllowedRules{allowAll: true}
+	return AllowedRules{deferToStatic: true}
 }
 
 // AccessScoper is the lowest-common-denominator interface satisfied by both

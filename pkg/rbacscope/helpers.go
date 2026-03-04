@@ -192,7 +192,7 @@ func validateCoreInputs(
 	if err := validateDNS1123Subdomain("OperatorIdentity.Namespace", identity.Namespace); err != nil {
 		return scopeConfig{}, nil, err
 	}
-	if !allowed.allowAll && len(allowed.rules) == 0 {
+	if !allowed.deferToStatic && len(allowed.rules) == 0 {
 		return scopeConfig{}, nil, fmt.Errorf("AllowedRules must not be empty")
 	}
 
@@ -202,13 +202,13 @@ func validateCoreInputs(
 	}
 
 	var rules []rbacv1.PolicyRule
-	if !allowed.allowAll {
+	if !allowed.deferToStatic {
 		rules = make([]rbacv1.PolicyRule, len(allowed.rules))
 		for i := range allowed.rules {
 			rules[i] = *allowed.rules[i].DeepCopy()
 		}
 	}
-	// When allowed.allowAll is true, rules stays nil (no ceiling enforcement).
+	// When allowed.deferToStatic is true, rules stays nil (no ceiling enforcement).
 
 	return cfg, rules, nil
 }

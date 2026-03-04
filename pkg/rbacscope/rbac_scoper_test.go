@@ -706,7 +706,7 @@ func TestNewRBACScoper_ValidationErrors(t *testing.T) {
 				ServiceAccount: "test-sa",
 				Namespace:      "test-ns",
 			},
-			allowed: AllowedRules{}, // zero-value: no rules and allowAll=false
+			allowed: AllowedRules{}, // zero-value: no rules and deferToStatic=false
 			errMsg:  "AllowedRules must not be empty",
 		},
 	}
