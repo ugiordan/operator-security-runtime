@@ -34,3 +34,6 @@ kind-cluster.yaml
 
 # MacOS
 .DS_Store
+
+# Design plans (local only)
+docs/plans/
