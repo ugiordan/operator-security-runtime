@@ -118,13 +118,13 @@ nodes, namespaces):
 
 ```mermaid
 flowchart TD
-    A[CR created] --> B[EnsureClusterAccess]
+    A[CR created] --> B[EnsureAccess]
     B --> C["Create/Update ClusterRole\nannotation-based ownership"]
     B --> D["Create/Update ClusterRoleBinding\nannotation-based ownership"]
     C --> E[Operator has cluster-wide access]
     D --> E
 
-    F[CR deleted] --> G[CleanupClusterAccess]
+    F[CR deleted] --> G[CleanupAccess]
     G --> H{Other owners?}
     H -- Yes --> I[Remove annotation, keep resources]
     H -- No --> J[Delete ClusterRole + ClusterRoleBinding]
@@ -274,10 +274,10 @@ clusterScoper, err := rbacscope.NewClusterRBACScoper(
 if err != nil { ... }
 
 // In your reconciler:
-if err := clusterScoper.EnsureClusterAccess(ctx, cr); err != nil { ... }
+if err := clusterScoper.EnsureAccess(ctx, cr); err != nil { ... }
 
 // During CR deletion:
-if err := clusterScoper.CleanupClusterAccess(ctx, cr); err != nil { ... }
+if err := clusterScoper.CleanupAccess(ctx, cr); err != nil { ... }
 ```
 
 Multiple resource types can be scoped in a single scoper by providing

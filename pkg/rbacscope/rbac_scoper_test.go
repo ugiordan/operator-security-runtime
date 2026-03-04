@@ -2658,3 +2658,10 @@ func TestGarbageCollectOrphanedOwners_NoAnnotations(t *testing.T) {
 		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
 	}
 }
+
+func TestAccessScoperInterface(t *testing.T) {
+	// Verify both types satisfy the interface at runtime.
+	// (Compile-time checks are in identity.go, this is for documentation.)
+	var _ AccessScoper = (*RBACScoper)(nil)
+	var _ AccessScoper = (*ClusterRBACScoper)(nil)
+}

@@ -74,10 +74,10 @@ func (s *ClusterRBACScoper) labels() map[string]string {
 	}
 }
 
-// EnsureClusterAccess creates/updates a ClusterRole and ClusterRoleBinding
+// EnsureAccess creates/updates a ClusterRole and ClusterRoleBinding
 // for the operator's ServiceAccount. Uses annotation-based ownership
 // (ClusterRoles are cluster-scoped, OwnerReferences require same-namespace).
-func (s *ClusterRBACScoper) EnsureClusterAccess(ctx context.Context, owner client.Object) error {
+func (s *ClusterRBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
 	log := ctrl.LoggerFrom(ctx)
 
 	if owner.GetNamespace() == "" {
@@ -180,12 +180,12 @@ func (s *ClusterRBACScoper) ensureClusterRoleBindingWithOwnership(
 	return nil
 }
 
-// CleanupClusterAccess removes the owner's annotation from the ClusterRole
+// CleanupAccess removes the owner's annotation from the ClusterRole
 // and ClusterRoleBinding. Deletes if no owners remain.
 // This is the cluster-scoped equivalent of RBACScoper.CleanupAllAccess;
 // because ClusterRBACScoper manages a single ClusterRole/ClusterRoleBinding
 // pair per operator, no listing is needed.
-func (s *ClusterRBACScoper) CleanupClusterAccess(ctx context.Context, owner client.Object) error {
+func (s *ClusterRBACScoper) CleanupAccess(ctx context.Context, owner client.Object) error {
 	if owner.GetNamespace() == "" {
 		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())

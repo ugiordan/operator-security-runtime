@@ -184,15 +184,15 @@ func TestNewClusterRBACScoper_DNS1123Validation(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterAccess_CreatesClusterRoleAndBinding(t *testing.T) {
+func TestClusterScoper_EnsureAccess_CreatesClusterRoleAndBinding(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
 	cr := newTestCR()
 	ctx := context.Background()
 
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureAccess returned error: %v", err)
 	}
 
 	// Verify ClusterRole was created
@@ -295,7 +295,7 @@ func TestEnsureClusterAccess_CreatesClusterRoleAndBinding(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterAccess_Idempotent(t *testing.T) {
+func TestClusterScoper_EnsureAccess_Idempotent(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -303,13 +303,13 @@ func TestEnsureClusterAccess_Idempotent(t *testing.T) {
 	ctx := context.Background()
 
 	// First call
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("first EnsureClusterAccess returned error: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("first EnsureAccess returned error: %v", err)
 	}
 
 	// Second call should not error
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("second EnsureClusterAccess returned error: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("second EnsureAccess returned error: %v", err)
 	}
 
 	// Verify ClusterRole still exists with single annotation entry
@@ -340,7 +340,7 @@ func TestEnsureClusterAccess_Idempotent(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterAccess_MultiOwnerAnnotation(t *testing.T) {
+func TestClusterScoper_EnsureAccess_MultiOwnerAnnotation(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -366,11 +366,11 @@ func TestEnsureClusterAccess_MultiOwnerAnnotation(t *testing.T) {
 	cr2.SetGroupVersionKind(testGVK)
 
 	// Ensure access for both
-	if err := scoper.EnsureClusterAccess(ctx, cr1); err != nil {
-		t.Fatalf("EnsureClusterAccess for cr1 failed: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr1); err != nil {
+		t.Fatalf("EnsureAccess for cr1 failed: %v", err)
 	}
-	if err := scoper.EnsureClusterAccess(ctx, cr2); err != nil {
-		t.Fatalf("EnsureClusterAccess for cr2 failed: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr2); err != nil {
+		t.Fatalf("EnsureAccess for cr2 failed: %v", err)
 	}
 
 	// Verify both owners are in the annotation
@@ -404,7 +404,7 @@ func TestEnsureClusterAccess_MultiOwnerAnnotation(t *testing.T) {
 	}
 }
 
-func TestCleanupClusterAccess_DeletesWhenNoOwnersRemain(t *testing.T) {
+func TestClusterScoper_CleanupAccess_DeletesWhenNoOwnersRemain(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -412,13 +412,13 @@ func TestCleanupClusterAccess_DeletesWhenNoOwnersRemain(t *testing.T) {
 	ctx := context.Background()
 
 	// First create
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureAccess returned error: %v", err)
 	}
 
 	// Then cleanup
-	if err := scoper.CleanupClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("CleanupClusterAccess returned error: %v", err)
+	if err := scoper.CleanupAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupAccess returned error: %v", err)
 	}
 
 	// Verify ClusterRole is gone
@@ -440,7 +440,7 @@ func TestCleanupClusterAccess_DeletesWhenNoOwnersRemain(t *testing.T) {
 	}
 }
 
-func TestCleanupClusterAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
+func TestClusterScoper_CleanupAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -465,16 +465,16 @@ func TestCleanupClusterAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
 	cr2.SetGroupVersionKind(testGVK)
 
 	// Ensure access for both
-	if err := scoper.EnsureClusterAccess(ctx, cr1); err != nil {
-		t.Fatalf("EnsureClusterAccess for cr1 failed: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr1); err != nil {
+		t.Fatalf("EnsureAccess for cr1 failed: %v", err)
 	}
-	if err := scoper.EnsureClusterAccess(ctx, cr2); err != nil {
-		t.Fatalf("EnsureClusterAccess for cr2 failed: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr2); err != nil {
+		t.Fatalf("EnsureAccess for cr2 failed: %v", err)
 	}
 
 	// Cleanup cr1 only
-	if err := scoper.CleanupClusterAccess(ctx, cr1); err != nil {
-		t.Fatalf("CleanupClusterAccess for cr1 failed: %v", err)
+	if err := scoper.CleanupAccess(ctx, cr1); err != nil {
+		t.Fatalf("CleanupAccess for cr1 failed: %v", err)
 	}
 
 	// ClusterRole should still exist with cr2's annotation
@@ -505,8 +505,8 @@ func TestCleanupClusterAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
 	}
 
 	// Now cleanup cr2 -- everything should be deleted
-	if err := scoper.CleanupClusterAccess(ctx, cr2); err != nil {
-		t.Fatalf("CleanupClusterAccess for cr2 failed: %v", err)
+	if err := scoper.CleanupAccess(ctx, cr2); err != nil {
+		t.Fatalf("CleanupAccess for cr2 failed: %v", err)
 	}
 
 	err := cl.Get(ctx, types.NamespacedName{
@@ -524,7 +524,7 @@ func TestCleanupClusterAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
 	}
 }
 
-func TestCleanupClusterAccess_NoErrorWhenNotFound(t *testing.T) {
+func TestClusterScoper_CleanupAccess_NoErrorWhenNotFound(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -532,12 +532,12 @@ func TestCleanupClusterAccess_NoErrorWhenNotFound(t *testing.T) {
 	ctx := context.Background()
 
 	// Cleanup without creating anything should not error
-	if err := scoper.CleanupClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("CleanupClusterAccess returned error when nothing existed: %v", err)
+	if err := scoper.CleanupAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupAccess returned error when nothing existed: %v", err)
 	}
 }
 
-func TestEnsureClusterAccess_RejectsClusterScopedOwner(t *testing.T) {
+func TestClusterScoper_EnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 	scoper := newTestClusterScoper(t, cl)
@@ -553,8 +553,8 @@ func TestEnsureClusterAccess_RejectsClusterScopedOwner(t *testing.T) {
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
 
-	// EnsureClusterAccess should reject cluster-scoped owners
-	err := scoper.EnsureClusterAccess(ctx, clusterCR)
+	// EnsureAccess should reject cluster-scoped owners
+	err := scoper.EnsureAccess(ctx, clusterCR)
 	if err == nil {
 		t.Fatal("expected error for cluster-scoped owner, got nil")
 	}
@@ -562,17 +562,17 @@ func TestEnsureClusterAccess_RejectsClusterScopedOwner(t *testing.T) {
 		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
 	}
 
-	// CleanupClusterAccess should also reject
-	err = scoper.CleanupClusterAccess(ctx, clusterCR)
+	// CleanupAccess should also reject
+	err = scoper.CleanupAccess(ctx, clusterCR)
 	if err == nil {
-		t.Fatal("expected error from CleanupClusterAccess for cluster-scoped owner, got nil")
+		t.Fatal("expected error from CleanupAccess for cluster-scoped owner, got nil")
 	}
 	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("CleanupClusterAccess: expected error about namespace-scoped, got %q", err.Error())
+		t.Errorf("CleanupAccess: expected error about namespace-scoped, got %q", err.Error())
 	}
 }
 
-func TestEnsureClusterAccess_ClusterRoleBindingDriftRecovery(t *testing.T) {
+func TestClusterScoper_EnsureAccess_ClusterRoleBindingDriftRecovery(t *testing.T) {
 	s := testScheme()
 
 	// Pre-create a ClusterRoleBinding with a DIFFERENT RoleRef to simulate drift.
@@ -615,9 +615,9 @@ func TestEnsureClusterAccess_ClusterRoleBindingDriftRecovery(t *testing.T) {
 	cr := newTestCR()
 	ctx := context.Background()
 
-	// EnsureClusterAccess should succeed by detecting the invalid error and recreating.
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("EnsureClusterAccess should recover from ClusterRoleBinding drift, got error: %v", err)
+	// EnsureAccess should succeed by detecting the invalid error and recreating.
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureAccess should recover from ClusterRoleBinding drift, got error: %v", err)
 	}
 
 	// Verify the ClusterRoleBinding now has the correct RoleRef.
@@ -641,7 +641,7 @@ func TestEnsureClusterAccess_ClusterRoleBindingDriftRecovery(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T) {
+func TestClusterScoper_EnsureAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 
@@ -662,8 +662,8 @@ func TestEnsureClusterAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T)
 	cr := newTestCR()
 	ctx := context.Background()
 
-	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
-		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureAccess returned error: %v", err)
 	}
 
 	// Verify ClusterRole has zero rules when AllowAllRules is used

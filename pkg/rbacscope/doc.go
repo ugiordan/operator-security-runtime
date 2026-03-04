@@ -58,6 +58,6 @@
 //	)
 //	if err != nil { ... }
 //
-//	if err := clusterScoper.EnsureClusterAccess(ctx, cr); err != nil { ... }
-//	if err := clusterScoper.CleanupClusterAccess(ctx, cr); err != nil { ... }
+//	if err := clusterScoper.EnsureAccess(ctx, cr); err != nil { ... }
+//	if err := clusterScoper.CleanupAccess(ctx, cr); err != nil { ... }
 package rbacscope

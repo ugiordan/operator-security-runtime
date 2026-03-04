@@ -320,12 +320,12 @@ For resources that require cluster-wide access (e.g., `nodes`, `namespaces`, `pe
 
 ```mermaid
 flowchart TD
-    A[EnsureClusterAccess] --> B["Create/Update ClusterRole\noperator-cluster-scoped-access\nRules: configured PolicyRules\nAnnotation ownership"]
+    A[EnsureAccess] --> B["Create/Update ClusterRole\noperator-cluster-scoped-access\nRules: configured PolicyRules\nAnnotation ownership"]
     A --> C["Create/Update ClusterRoleBinding\noperator-cluster-scoped-access-binding\nSubject: operator SA\nAnnotation ownership"]
     B --> D[Operator has cluster-wide access]
     C --> D
 
-    E[CleanupClusterAccess] --> F["Remove owner annotation"]
+    E[CleanupAccess] --> F["Remove owner annotation"]
     F --> G{Other owners?}
     G -- Yes --> H[Keep ClusterRole + ClusterRoleBinding]
     G -- No --> I[Delete both]

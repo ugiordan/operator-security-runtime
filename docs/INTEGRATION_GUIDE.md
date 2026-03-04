@@ -370,12 +370,12 @@ In your reconciler:
 
 ```go
 // Ensure cluster-scoped access
-if err := r.ClusterRBACScoper.EnsureClusterAccess(ctx, cr); err != nil {
+if err := r.ClusterRBACScoper.EnsureAccess(ctx, cr); err != nil {
     return ctrl.Result{}, fmt.Errorf("ensuring cluster access: %w", err)
 }
 
 // In finalizer
-if err := r.ClusterRBACScoper.CleanupClusterAccess(ctx, cr); err != nil {
+if err := r.ClusterRBACScoper.CleanupAccess(ctx, cr); err != nil {
     return ctrl.Result{}, fmt.Errorf("cleaning up cluster access: %w", err)
 }
 ```
