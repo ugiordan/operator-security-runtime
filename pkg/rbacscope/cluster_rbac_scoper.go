@@ -32,7 +32,10 @@ type ClusterRBACScoper struct {
 
 // NewClusterRBACScoper creates a validated ClusterRBACScoper. All required
 // parameters are validated up front; if any are invalid the constructor
-// returns an error.
+// returns an error. Unlike NewRBACScoper, no scheme parameter is needed
+// because ClusterRBACScoper uses annotation-based ownership exclusively
+// (ClusterRoles are cluster-scoped and cannot use OwnerReferences to
+// namespaced resources).
 func NewClusterRBACScoper(
 	cl client.Client,
 	identity OperatorIdentity,

@@ -1548,6 +1548,35 @@ func TestIsDeniedNamespace(t *testing.T) {
 	if scoper2.isDeniedNamespace("kube-system") {
 		t.Error("kube-system should NOT be denied when custom list replaces defaults")
 	}
+
+	// Test WithAdditionalDeniedNamespaces: appends without removing defaults
+	scoper3, err := NewRBACScoper(cl, s,
+		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
+		allowed,
+		WithAdditionalDeniedNamespaces("extra-ns", "team-"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Defaults must still be denied
+	if !scoper3.isDeniedNamespace("kube-system") {
+		t.Error("kube-system should still be denied with WithAdditionalDeniedNamespaces")
+	}
+	if !scoper3.isDeniedNamespace("openshift-monitoring") {
+		t.Error("openshift-monitoring should still be denied with WithAdditionalDeniedNamespaces")
+	}
+	// Additional namespaces must also be denied
+	if !scoper3.isDeniedNamespace("extra-ns") {
+		t.Error("extra-ns should be denied via WithAdditionalDeniedNamespaces")
+	}
+	if !scoper3.isDeniedNamespace("team-alpha") {
+		t.Error("team-alpha should be denied via prefix match from WithAdditionalDeniedNamespaces")
+	}
+	// Unrelated namespace must not be denied
+	if scoper3.isDeniedNamespace("my-app") {
+		t.Error("my-app should not be denied")
+	}
 }
 
 func TestEnsureAccessInNamespace_RejectsClusterScopedOwner(t *testing.T) {
@@ -2680,6 +2709,41 @@ func TestGarbageCollectOrphanedOwners_NoAnnotations(t *testing.T) {
 	}
 	if result.ResourcesDeleted != 0 {
 		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_ResolverErrorPropagates(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "error-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "error-ns/cr1/uid1",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolverErr := fmt.Errorf("simulated API failure")
+	failingResolver := func(ctx context.Context, ns, name string, uid types.UID) (bool, error) {
+		return false, resolverErr
+	}
+
+	_, err := scoper.GarbageCollectOrphanedOwners(ctx, failingResolver)
+	if err == nil {
+		t.Fatal("expected error from GarbageCollectOrphanedOwners when resolver fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "simulated API failure") {
+		t.Errorf("expected error to contain resolver message, got %q", err.Error())
 	}
 }
 

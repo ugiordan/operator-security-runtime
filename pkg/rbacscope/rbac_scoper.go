@@ -30,6 +30,10 @@ type RBACScoper struct {
 
 // NewRBACScoper creates a validated RBACScoper. All required parameters are
 // validated up front; if any are invalid the constructor returns an error.
+// The scheme parameter is required because RBACScoper uses OwnerReferences
+// for same-namespace resources, and SetOwnerReference needs the scheme to
+// look up the owner's GVK. ClusterRBACScoper does not need scheme because
+// it uses annotation-based ownership exclusively.
 func NewRBACScoper(
 	cl client.Client,
 	scheme *runtime.Scheme,

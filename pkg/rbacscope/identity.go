@@ -46,9 +46,13 @@ func DeferToStaticRBAC() AllowedRules {
 	return AllowedRules{allowAll: true}
 }
 
-// AccessScoper is the common interface satisfied by both RBACScoper and
-// ClusterRBACScoper. It enables generic wrappers, middleware, and testing
-// mocks that work with either scoper type.
+// AccessScoper is the lowest-common-denominator interface satisfied by both
+// RBACScoper and ClusterRBACScoper. It exposes only the methods shared by
+// both scoper types, enabling generic wrappers, middleware, and testing mocks.
+//
+// RBACScoper-specific methods (EnsureAccessInNamespace, CleanupAccessInNamespace,
+// CleanupAllAccess) are not part of this interface. Use the concrete type when
+// cross-namespace operations are needed.
 //
 // RBACScoper manages namespace-scoped Roles/RoleBindings.
 // ClusterRBACScoper manages cluster-scoped ClusterRoles/ClusterRoleBindings.
