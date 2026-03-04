@@ -47,6 +47,13 @@ func NewClusterRBACScoper(
 		ctrl.Log.Info("ClusterRBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
+	// Warn if denied namespace options were passed — they have no effect on
+	// cluster-scoped resources but may indicate a misconfiguration.
+	if cfg.deniedNamespacesModified {
+		ctrl.Log.Info("ClusterRBACScoper: WithDeniedNamespaces/WithAdditionalDeniedNamespaces "+
+			"options have no effect on cluster-scoped resources",
+			"operatorName", identity.Name)
+	}
 	return &ClusterRBACScoper{
 		client:              cl,
 		operatorName:        identity.Name,
@@ -233,6 +240,10 @@ func (s *ClusterRBACScoper) cleanupClusterResource(
 	}
 
 	if err := s.client.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("resource already deleted during cleanup", "kind", kind, "name", key.Name)
+			return nil
+		}
 		return fmt.Errorf("updating %s %s to remove owner: %w", kind, key.Name, err)
 	}
 	log.Info("removed owner annotation from "+kind+" (other owners remain)", "name", key.Name)

@@ -11,8 +11,9 @@ func (f optionFunc) apply(s *scopeConfig) { f(s) }
 
 // scopeConfig holds optional configuration for an RBACScoper.
 type scopeConfig struct {
-	deniedNamespaces      []string
-	aggregationLabelCheck bool
+	deniedNamespaces         []string
+	deniedNamespacesModified bool // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
+	aggregationLabelCheck    bool
 }
 
 func defaultScopeConfig() scopeConfig {
@@ -35,6 +36,7 @@ func defaultScopeConfig() scopeConfig {
 func WithDeniedNamespaces(namespaces ...string) Option {
 	return optionFunc(func(s *scopeConfig) {
 		s.deniedNamespaces = namespaces
+		s.deniedNamespacesModified = true
 	})
 }
 
@@ -45,6 +47,7 @@ func WithDeniedNamespaces(namespaces ...string) Option {
 func WithAdditionalDeniedNamespaces(namespaces ...string) Option {
 	return optionFunc(func(s *scopeConfig) {
 		s.deniedNamespaces = append(s.deniedNamespaces, namespaces...)
+		s.deniedNamespacesModified = true
 	})
 }
 
