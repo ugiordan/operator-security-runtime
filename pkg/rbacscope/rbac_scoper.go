@@ -224,8 +224,8 @@ func (s *RBACScoper) CleanupAccess(ctx context.Context, owner client.Object) err
 }
 
 // cleanupOwnedResource removes the owner's OwnerReference from the given
-// resource. If no OwnerReferences remain after removal, the resource is
-// deleted entirely.
+// resource. If no owners remain (neither OwnerReferences nor annotation
+// entries), the resource is deleted entirely.
 func (s *RBACScoper) cleanupOwnedResource(
 	ctx context.Context,
 	obj client.Object,
@@ -242,7 +242,13 @@ func (s *RBACScoper) cleanupOwnedResource(
 	}
 
 	s.removeOwnerRef(obj, owner)
-	if len(obj.GetOwnerReferences()) == 0 {
+
+	// Check both ownership mechanisms: the resource might also have
+	// cross-namespace annotation owners from EnsureAccessInNamespace.
+	hasOwnerRefs := len(obj.GetOwnerReferences()) > 0
+	hasAnnotationOwners := s.ownerTracker.hasOwners(obj)
+
+	if !hasOwnerRefs && !hasAnnotationOwners {
 		if err := s.client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("deleting %s %s: %w", kind, key, err)
 		}
@@ -251,10 +257,15 @@ func (s *RBACScoper) cleanupOwnedResource(
 	}
 
 	if err := s.client.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("resource already deleted during cleanup", "kind", kind, "namespace", key.Namespace)
+			return nil
+		}
 		return fmt.Errorf("updating %s %s to remove owner: %w", kind, key, err)
 	}
 	log.Info("removed OwnerReference from "+kind+" (other owners remain)",
-		"namespace", key.Namespace, "remainingOwners", len(obj.GetOwnerReferences()))
+		"namespace", key.Namespace, "remainingOwners", len(obj.GetOwnerReferences()),
+		"hasAnnotationOwners", hasAnnotationOwners)
 	return nil
 }
 

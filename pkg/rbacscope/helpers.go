@@ -82,11 +82,11 @@ func (t *annotationOwnerTracker) addOwner(obj client.Object, owner client.Object
 		return nil
 	}
 
-	// Check if owner is already present. Count only non-empty, trimmed
-	// entries so that corrupted annotations with consecutive commas or
-	// whitespace do not inflate the count toward maxAnnotationOwners.
+	// Parse existing entries, skipping empty/whitespace segments from
+	// corrupted annotations. Rebuild from valid entries to prevent
+	// corruption from accumulating over successive addOwner calls.
 	rawEntries := strings.Split(existing, ",")
-	validCount := 0
+	validEntries := make([]string, 0, len(rawEntries))
 	for _, entry := range rawEntries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -95,14 +95,14 @@ func (t *annotationOwnerTracker) addOwner(obj client.Object, owner client.Object
 		if entry == key {
 			return nil // already present
 		}
-		validCount++
+		validEntries = append(validEntries, entry)
 	}
 
-	if validCount >= maxAnnotationOwners {
+	if len(validEntries) >= maxAnnotationOwners {
 		return fmt.Errorf("maximum owner count (%d) exceeded for annotation %s", maxAnnotationOwners, t.annotationKey)
 	}
 
-	annotations[t.annotationKey] = existing + "," + key
+	annotations[t.annotationKey] = strings.Join(append(validEntries, key), ",")
 	obj.SetAnnotations(annotations)
 	return nil
 }
@@ -315,7 +315,9 @@ func gcAnnotationOwnersShared(
 		ns, name, uid := parts[0], parts[1], types.UID(parts[2])
 		exists, resolveErr := resolver(ctx, ns, name, uid)
 		if resolveErr != nil {
-			return removed, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
+			// Return 0 for removed: no changes have been persisted yet,
+			// so reporting partial removals would be misleading.
+			return 0, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
 		}
 		if !exists {
 			log.Info("removing orphaned annotation entry", "entry", entry, "kind", kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
