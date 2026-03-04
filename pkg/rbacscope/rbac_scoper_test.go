@@ -1899,6 +1899,24 @@ func TestAnnotationCorruptionResilience(t *testing.T) {
 		}
 	})
 
+	t.Run("addOwner limit not inflated by empty entries", func(t *testing.T) {
+		// Annotation with many consecutive commas — raw Split produces far
+		// more entries than real owners. The limit check must count only
+		// non-empty trimmed entries.
+		corrupted := "ns1/name1/uid1" + strings.Repeat(",", 200)
+		obj := objWithAnnotation(corrupted)
+
+		newOwner := makeOwner("ns2", "name2", "uid2")
+		if err := tracker.addOwner(obj, newOwner); err != nil {
+			t.Fatalf("addOwner should succeed (only 1 real owner), got error: %v", err)
+		}
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		if !strings.Contains(annotation, "ns2/name2/uid2") {
+			t.Errorf("expected new owner in annotation, got %q", annotation)
+		}
+	})
+
 	t.Run("removeOwner from corrupted annotation preserves others", func(t *testing.T) {
 		// Mix of valid and corrupted entries
 		obj := objWithAnnotation("corrupted-entry,ns/valid-owner/valid-uid,,,also-corrupted")

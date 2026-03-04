@@ -80,9 +80,12 @@ func (t *annotationOwnerTracker) addOwner(obj client.Object, owner client.Object
 		return nil
 	}
 
-	// Check if owner is already present
-	entries := strings.Split(existing, ",")
-	for _, entry := range entries {
+	// Check if owner is already present. Count only non-empty, trimmed
+	// entries so that corrupted annotations with consecutive commas or
+	// whitespace do not inflate the count toward maxAnnotationOwners.
+	rawEntries := strings.Split(existing, ",")
+	validCount := 0
+	for _, entry := range rawEntries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -90,9 +93,10 @@ func (t *annotationOwnerTracker) addOwner(obj client.Object, owner client.Object
 		if entry == key {
 			return nil // already present
 		}
+		validCount++
 	}
 
-	if len(entries) >= maxAnnotationOwners {
+	if validCount >= maxAnnotationOwners {
 		return fmt.Errorf("maximum owner count (%d) exceeded for annotation %s", maxAnnotationOwners, t.annotationKey)
 	}
 
