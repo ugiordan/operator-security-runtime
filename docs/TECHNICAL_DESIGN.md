@@ -314,6 +314,102 @@ Key properties:
 - **Size-limited:** Maximum 100 owner entries per resource to prevent unbounded growth.
 - **Optimistic concurrency:** Uses `CreateOrUpdate` with `resourceVersion` to prevent concurrent overwrites.
 
+### Operational Robustness
+
+#### Constructor Validation (DNS-1123)
+
+Both `NewRBACScoper` and `NewClusterRBACScoper` validate all `OperatorIdentity` fields (Name, ServiceAccount, Namespace) against DNS-1123 subdomain rules at construction time. Validation is performed in the shared `validateCoreInputs` function, ensuring fail-fast behavior -- invalid inputs produce descriptive errors before any RBAC operations occur.
+
+The validation regex is `^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$` with a maximum length of 253 characters. This matches the Kubernetes requirement for resource names and prevents subtle runtime failures from malformed identity strings propagating into Role/RoleBinding names or annotation values.
+
+#### Annotation Corruption Resilience
+
+The `annotationOwnerTracker` (`addOwner`, `removeOwner`, `hasOwners`) defensively handles corrupted annotation values. Specifically, it handles:
+
+- Trailing, leading, or multiple consecutive commas
+- Entries consisting only of commas
+- Whitespace-only entries
+- Entries without the expected `namespace/name/uid` format
+
+All annotation operations trim whitespace and skip empty entries, ensuring that corrupted annotations do not cause panics or incorrect ownership decisions. This resilience is verified by 8 dedicated subtests in `TestAnnotationCorruptionResilience`.
+
+#### Paginated Listing
+
+`CleanupAllAccess` and `GarbageCollectOrphanedOwners` on `RBACScoper` use paginated listing with `client.Limit(100)` and a continuation token loop (`client.Continue`). This prevents API server overload when an operator manages resources across many namespaces.
+
+```
+cleanupListPageSize = 100
+```
+
+Each page of results is processed before fetching the next page. The loop terminates when the continuation token is empty.
+
+#### Orphan Garbage Collection
+
+`GarbageCollectOrphanedOwners` is available on both `RBACScoper` and `ClusterRBACScoper` (via the `AccessScoper` interface). It scans managed RBAC resources and removes stale annotation entries for owners that no longer exist.
+
+**Method signature:**
+
+```go
+GarbageCollectOrphanedOwners(ctx context.Context, resolver OwnerResolver) (GCResult, error)
+```
+
+**`OwnerResolver`** is a callback function type:
+
+```go
+type OwnerResolver func(ctx context.Context, namespace, name string, uid types.UID) (exists bool, err error)
+```
+
+Callers provide the resolution logic, keeping the library independent of specific CR types.
+
+**`GCResult`** reports what happened:
+
+| Field | Description |
+|-------|-------------|
+| `ResourcesScanned` | Number of managed resources examined |
+| `EntriesRemoved` | Number of stale owner entries removed from annotations |
+| `ResourcesDeleted` | Number of resources deleted because no owners remained |
+
+**Behavior differences by scoper type:**
+
+- `RBACScoper`: checks both OwnerReferences AND annotation entries before deleting a resource. A resource with remaining OwnerReferences is kept even if all annotation entries are removed.
+- `ClusterRBACScoper`: checks only annotation entries (cluster-scoped resources cannot have OwnerReferences pointing to namespaced resources).
+
+Malformed annotation entries (entries not matching `namespace/name/uid` format) are treated as stale and removed unconditionally.
+
+**Recommended invocation:** call periodically, for example on leader election start or on a timer during the reconciler's lifecycle.
+
+#### Targeted Cleanup
+
+`CleanupAccessInNamespace(ctx, owner, targetNS)` provides targeted cross-namespace cleanup for a single namespace. It complements `CleanupAllAccess` (which cleans up all managed resources across all namespaces) by allowing operators to revoke access in a specific namespace -- for example, when a CR's target namespace reference changes.
+
+Behavior:
+
+- If `targetNS == owner.GetNamespace()`, delegates to `CleanupAccess` (OwnerReference-based cleanup).
+- Otherwise, performs a Get-based lookup of the managed Role and RoleBinding in `targetNS`, removes the owner's annotation entry, and deletes the resources if no owners remain.
+- Returns an error if `targetNS` is empty or if the owner is cluster-scoped.
+- Returns no error if the managed resources do not exist in the target namespace.
+
+#### AccessScoper Interface
+
+`AccessScoper` is a common interface defined in `identity.go` that is satisfied by both `*RBACScoper` and `*ClusterRBACScoper`:
+
+```go
+type AccessScoper interface {
+    EnsureAccess(ctx context.Context, owner client.Object) error
+    CleanupAccess(ctx context.Context, owner client.Object) error
+    GarbageCollectOrphanedOwners(ctx context.Context, resolver OwnerResolver) (GCResult, error)
+}
+```
+
+Compile-time interface satisfaction is enforced:
+
+```go
+var _ AccessScoper = (*RBACScoper)(nil)
+var _ AccessScoper = (*ClusterRBACScoper)(nil)
+```
+
+This enables generic middleware, wrappers, and testing mocks that work with either scoper type. `ClusterRBACScoper` methods were renamed from `EnsureClusterAccess`/`CleanupClusterAccess` to `EnsureAccess`/`CleanupAccess` to satisfy the shared interface.
+
 ### Cluster-Scoped Grants (ClusterRBACScoper)
 
 For resources that require cluster-wide access (e.g., `nodes`, `namespaces`, `persistentvolumes`), `ClusterRBACScoper` manages ClusterRoles and ClusterRoleBindings. It uses annotation-based ownership exclusively because ClusterRoles are cluster-scoped and cannot have OwnerReferences pointing to namespaced resources.

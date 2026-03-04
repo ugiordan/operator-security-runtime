@@ -16,6 +16,17 @@
 // access, AllowAllRules can be used as an explicit escape hatch that bypasses the
 // ceiling enforcement.
 //
+// CleanupAccessInNamespace provides targeted cross-namespace cleanup for a single
+// namespace, complementing CleanupAllAccess which operates across all namespaces.
+//
+// GarbageCollectOrphanedOwners scans managed resources and removes stale annotation
+// entries for owners that no longer exist. It accepts an OwnerResolver callback
+// and returns a GCResult with scan statistics.
+//
+// Both scopers satisfy the AccessScoper interface, which provides EnsureAccess,
+// CleanupAccess, and GarbageCollectOrphanedOwners. This enables generic middleware,
+// wrappers, and testing mocks that work with either scoper type.
+//
 // Namespace-scoped usage:
 //
 //	allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{

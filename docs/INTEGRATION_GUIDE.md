@@ -333,13 +333,18 @@ OwnerReferences (since Kubernetes OwnerReferences cannot cross namespace
 boundaries). If `targetNS` equals the CR's own namespace, the call delegates
 to `EnsureAccess` (using OwnerReferences).
 
-For cleanup, use `CleanupAllAccess` which finds and cleans up all managed
-Roles and RoleBindings across namespaces:
+For cleanup, use `CleanupAllAccess` (all namespaces) or
+`CleanupAccessInNamespace` (single namespace):
 
 ```go
 // In finalizer: clean up all managed access across all namespaces
 if err := r.RBACScoper.CleanupAllAccess(ctx, cr); err != nil {
     return ctrl.Result{}, fmt.Errorf("cleaning up all access: %w", err)
+}
+
+// Or: remove access from a specific namespace (e.g., when a target reference changes)
+if err := r.RBACScoper.CleanupAccessInNamespace(ctx, cr, oldTargetNS); err != nil {
+    return ctrl.Result{}, fmt.Errorf("cleaning up access in namespace: %w", err)
 }
 ```
 
@@ -387,6 +392,113 @@ are required:
 ```go
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;delete;escalate
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;delete
+```
+
+### 3.9 Orphan Garbage Collection
+
+Over time, annotation-based owner entries can become stale if a CR is deleted
+without its finalizer running (e.g., force-deletion, etcd restore). Use
+`GarbageCollectOrphanedOwners` to periodically scan managed resources and
+remove stale entries.
+
+Provide an `OwnerResolver` callback that checks whether a given owner still
+exists. The library calls this for each annotation entry it finds:
+
+```go
+resolver := func(ctx context.Context, ns, name string, uid types.UID) (bool, error) {
+    var cr yourv1.YourResource
+    err := client.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cr)
+    if apierrors.IsNotFound(err) {
+        return false, nil
+    }
+    if err != nil {
+        return false, err
+    }
+    return cr.UID == uid, nil
+}
+
+result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+if err != nil {
+    log.Error(err, "garbage collection failed")
+}
+log.Info("GC completed",
+    "scanned", result.ResourcesScanned,
+    "entriesRemoved", result.EntriesRemoved,
+    "resourcesDeleted", result.ResourcesDeleted)
+```
+
+The `GCResult` reports how many resources were scanned, how many stale
+entries were removed, and how many resources were deleted (because no owners
+remained after cleanup).
+
+**When to call:** on leader election start, on a periodic timer, or during
+operator startup. Both `RBACScoper` and `ClusterRBACScoper` implement this
+method (via the `AccessScoper` interface).
+
+### 3.10 Targeted Cleanup
+
+`CleanupAccessInNamespace` removes the owner's RBAC resources from a single
+target namespace. Use this when a CR's target namespace reference changes and
+you need to revoke access in the old namespace without doing a full
+`CleanupAllAccess`:
+
+```go
+// A CR previously referenced namespace "old-ns" and now references "new-ns".
+// Revoke access in the old namespace:
+if err := r.RBACScoper.CleanupAccessInNamespace(ctx, cr, oldTargetNS); err != nil {
+    return ctrl.Result{}, fmt.Errorf("revoking access in old namespace: %w", err)
+}
+
+// Grant access in the new namespace:
+if err := r.RBACScoper.EnsureAccessInNamespace(ctx, cr, newTargetNS); err != nil {
+    return ctrl.Result{}, fmt.Errorf("ensuring access in new namespace: %w", err)
+}
+```
+
+If the target namespace equals the CR's own namespace, the call delegates to
+`CleanupAccess` (OwnerReference-based). If the managed resources do not exist
+in the target namespace, no error is returned.
+
+### 3.11 Using the AccessScoper Interface
+
+Both `*RBACScoper` and `*ClusterRBACScoper` satisfy the `AccessScoper`
+interface, which provides `EnsureAccess`, `CleanupAccess`, and
+`GarbageCollectOrphanedOwners`. Use this interface for generic code that
+works with either scoper type:
+
+```go
+type MyReconciler struct {
+    client.Client
+    Scheme  *runtime.Scheme
+    Scoper  rbacscope.AccessScoper // works with either scoper type
+}
+
+func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cr := &yourv1.YourResource{}
+    if err := r.Get(ctx, req.NamespacedName, cr); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    if err := r.Scoper.EnsureAccess(ctx, cr); err != nil {
+        return ctrl.Result{}, fmt.Errorf("ensuring scoped access: %w", err)
+    }
+    // ...
+    return ctrl.Result{}, nil
+}
+```
+
+This is useful for writing middleware, wrapper functions, and testing mocks
+that accept any scoper implementation:
+
+```go
+func runGC(ctx context.Context, scoper rbacscope.AccessScoper, resolver rbacscope.OwnerResolver) error {
+    result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+    if err != nil {
+        return err
+    }
+    log.Info("GC completed", "entriesRemoved", result.EntriesRemoved)
+    return nil
+}
 ```
 
 ---

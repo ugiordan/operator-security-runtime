@@ -280,6 +280,36 @@ if err := clusterScoper.EnsureAccess(ctx, cr); err != nil { ... }
 if err := clusterScoper.CleanupAccess(ctx, cr); err != nil { ... }
 ```
 
+**Operational features:**
+
+Constructor validation enforces DNS-1123 rules on all `OperatorIdentity`
+fields at construction time -- invalid names are rejected immediately with
+descriptive errors.
+
+Orphan garbage collection removes stale annotation entries from managed
+resources when CRs are deleted without their finalizers running:
+
+```go
+resolver := func(ctx context.Context, ns, name string, uid types.UID) (bool, error) {
+    var cr yourv1.YourResource
+    err := client.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cr)
+    if apierrors.IsNotFound(err) { return false, nil }
+    if err != nil { return false, err }
+    return cr.UID == uid, nil
+}
+result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+```
+
+Targeted cleanup via `CleanupAccessInNamespace(ctx, cr, targetNS)` revokes
+access in a single namespace without performing a full `CleanupAllAccess`.
+
+The `AccessScoper` interface is satisfied by both `*RBACScoper` and
+`*ClusterRBACScoper`, enabling generic middleware and testing mocks:
+
+```go
+var scoper rbacscope.AccessScoper = rbacScoper // or clusterScoper
+```
+
 Multiple resource types can be scoped in a single scoper by providing
 multiple `PolicyRule` entries to `NewAllowedRules`:
 
