@@ -1,11 +1,13 @@
 package rbacscope
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -215,4 +217,50 @@ func (s *RBACScoper) isDeniedNamespace(ns string) bool {
 		}
 	}
 	return false
+}
+
+// OwnerResolver checks if an owner identified by namespace/name/uid still
+// exists. Returns true if the owner is still valid, false if it should be
+// considered orphaned. The resolver is a function type to keep the library
+// independent of specific CR types — callers provide the resolution logic.
+type OwnerResolver func(ctx context.Context, namespace, name string, uid types.UID) (exists bool, err error)
+
+// GCResult contains the results of a garbage collection run.
+type GCResult struct {
+	// ResourcesScanned is the number of managed resources examined.
+	ResourcesScanned int
+	// EntriesRemoved is the number of stale owner entries removed.
+	EntriesRemoved int
+	// ResourcesDeleted is the number of resources deleted (no owners remaining).
+	ResourcesDeleted int
+}
+
+// gcSplitAnnotationEntries splits a comma-separated annotation value into
+// individual non-empty, trimmed entries. Used by GC methods.
+func gcSplitAnnotationEntries(value string) []string {
+	raw := strings.Split(value, ",")
+	entries := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		entry = strings.TrimSpace(entry)
+		if entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// gcParseOwnerEntry parses a single annotation entry in "namespace/name/uid"
+// format. Returns nil if the entry is malformed (not exactly 3 parts).
+func gcParseOwnerEntry(entry string) []string {
+	parts := strings.SplitN(entry, "/", 3)
+	if len(parts) != 3 {
+		return nil
+	}
+	return parts
+}
+
+// gcJoinAnnotationEntries joins annotation entries back into a comma-separated
+// string.
+func gcJoinAnnotationEntries(entries []string) string {
+	return strings.Join(entries, ",")
 }

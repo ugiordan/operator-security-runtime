@@ -1921,3 +1921,740 @@ func TestAnnotationCorruptionResilience(t *testing.T) {
 		}
 	})
 }
+
+// --- CleanupAccessInNamespace Tests ---
+
+func TestCleanupAccessInNamespace_SameNamespaceDelegation(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "same-ns-cr",
+			Namespace: "my-ns",
+			UID:       types.UID("same-ns-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// Create access in same namespace (uses OwnerReferences via EnsureAccess delegation)
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "my-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify resources exist
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "my-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist: %v", err)
+	}
+	if len(role.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 OwnerReference, got %d", len(role.OwnerReferences))
+	}
+
+	// CleanupAccessInNamespace with same namespace should delegate to CleanupAccess
+	if err := scoper.CleanupAccessInNamespace(ctx, cr, "my-ns"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify Role is deleted (single owner, so OwnerRef removal leads to deletion)
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "my-ns",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted after same-namespace cleanup, got err=%v", err)
+	}
+
+	// Verify RoleBinding is also deleted
+	rb := &rbacv1.RoleBinding{}
+	err = scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "my-ns",
+	}, rb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected RoleBinding to be deleted after same-namespace cleanup, got err=%v", err)
+	}
+}
+
+func TestCleanupAccessInNamespace_CrossNamespaceCleanup(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cross-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("cross-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// Create cross-namespace access
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify resources exist in remote-ns
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "remote-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist in remote-ns: %v", err)
+	}
+
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "remote-ns",
+	}, rb); err != nil {
+		t.Fatalf("expected RoleBinding to exist in remote-ns: %v", err)
+	}
+
+	// Cleanup cross-namespace access
+	if err := scoper.CleanupAccessInNamespace(ctx, cr, "remote-ns"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify Role is deleted
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "remote-ns",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted after cross-namespace cleanup, got err=%v", err)
+	}
+
+	// Verify RoleBinding is deleted
+	err = scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "remote-ns",
+	}, rb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected RoleBinding to be deleted after cross-namespace cleanup, got err=%v", err)
+	}
+}
+
+func TestCleanupAccessInNamespace_PreservesOtherOwners(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	// Two owners from different namespaces, both granting access to the same remote-ns
+	cr1 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-alpha",
+			Namespace: "ns-alpha",
+			UID:       types.UID("uid-alpha"),
+		},
+	}
+	cr1.SetGroupVersionKind(testGVK)
+
+	cr2 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-beta",
+			Namespace: "ns-beta",
+			UID:       types.UID("uid-beta"),
+		},
+	}
+	cr2.SetGroupVersionKind(testGVK)
+
+	// Both grant access to the same remote namespace
+	if err := scoper.EnsureAccessInNamespace(ctx, cr1, "shared-remote"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace for cr1 failed: %v", err)
+	}
+	if err := scoper.EnsureAccessInNamespace(ctx, cr2, "shared-remote"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace for cr2 failed: %v", err)
+	}
+
+	// Verify both owners are in the annotation
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist: %v", err)
+	}
+	annotation := role.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(annotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected annotation to contain cr1's key, got %q", annotation)
+	}
+	if !strings.Contains(annotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected annotation to contain cr2's key, got %q", annotation)
+	}
+
+	// Cleanup only cr1 using CleanupAccessInNamespace
+	if err := scoper.CleanupAccessInNamespace(ctx, cr1, "shared-remote"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace for cr1 failed: %v", err)
+	}
+
+	// Role should still exist with cr2's annotation
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role); err != nil {
+		t.Fatal("Role was deleted when another owner (cr2) still exists")
+	}
+	remainingAnnotation := role.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(remainingAnnotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected remaining annotation to contain cr2's key, got %q", remainingAnnotation)
+	}
+	if strings.Contains(remainingAnnotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected cr1's key to be removed from annotation, got %q", remainingAnnotation)
+	}
+
+	// RoleBinding should also still exist
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "shared-remote",
+	}, rb); err != nil {
+		t.Fatal("RoleBinding was deleted when another owner (cr2) still exists")
+	}
+
+	// Cleanup cr2 -- now everything should be deleted
+	if err := scoper.CleanupAccessInNamespace(ctx, cr2, "shared-remote"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace for cr2 failed: %v", err)
+	}
+
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted after all owners cleaned up, got err=%v", err)
+	}
+
+	err = scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "shared-remote",
+	}, rb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected RoleBinding to be deleted after all owners cleaned up, got err=%v", err)
+	}
+}
+
+func TestCleanupAccessInNamespace_NotFoundNoError(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nonexistent-cr",
+			Namespace: "some-ns",
+			UID:       types.UID("nonexistent-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// CleanupAccessInNamespace when no managed resources exist should not error
+	if err := scoper.CleanupAccessInNamespace(ctx, cr, "nonexistent-remote-ns"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace returned error when no resources exist: %v", err)
+	}
+}
+
+func TestCleanupAccessInNamespace_EmptyTargetNS(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "empty-target-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("empty-target-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	err := scoper.CleanupAccessInNamespace(ctx, cr, "")
+	if err == nil {
+		t.Fatal("expected error for empty targetNS, got nil")
+	}
+	if !strings.Contains(err.Error(), "targetNS must not be empty") {
+		t.Errorf("expected error containing 'targetNS must not be empty', got %q", err.Error())
+	}
+}
+
+func TestCleanupAccessInNamespace_RejectsClusterScopedOwner(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	// Create a cluster-scoped resource (no namespace)
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-scoped-cr",
+			UID:  types.UID("cluster-uid"),
+			// No Namespace -- cluster-scoped
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	err := scoper.CleanupAccessInNamespace(ctx, clusterCR, "some-target-ns")
+	if err == nil {
+		t.Fatal("expected error for cluster-scoped owner in CleanupAccessInNamespace, got nil")
+	}
+	if !strings.Contains(err.Error(), "namespace-scoped") {
+		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	}
+}
+
+// --- GarbageCollectOrphanedOwners Tests ---
+
+// newTestResolver creates an OwnerResolver that reports entries in validEntries
+// as existing and all others as orphaned.
+func newTestResolver(validEntries map[string]bool) OwnerResolver {
+	return func(ctx context.Context, ns, name string, uid types.UID) (bool, error) {
+		key := fmt.Sprintf("%s/%s/%s", ns, name, string(uid))
+		return validEntries[key], nil
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_RemovesStaleEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Pre-create a Role with an annotation pointing to a non-existent CR
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "remote-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+		},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get", "list", "watch"},
+		}},
+	}
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access-binding",
+			Namespace: "remote-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "test-operator-scoped-access",
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role, rb)
+	scoper := newTestScoper(t, s, builder)
+
+	// Resolver says the owner does not exist
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 2 {
+		t.Errorf("expected 2 resources scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 2 {
+		t.Errorf("expected 2 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 2 {
+		t.Errorf("expected 2 resources deleted (no owners remain), got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role is deleted
+	gotRole := &rbacv1.Role{}
+	roleErr := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "remote-ns",
+	}, gotRole)
+	if !apierrors.IsNotFound(roleErr) {
+		t.Errorf("expected Role to be deleted, got err=%v", roleErr)
+	}
+
+	// Verify RoleBinding is deleted
+	gotRB := &rbacv1.RoleBinding{}
+	rbErr := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "remote-ns",
+	}, gotRB)
+	if !apierrors.IsNotFound(rbErr) {
+		t.Errorf("expected RoleBinding to be deleted, got err=%v", rbErr)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_PreservesValidEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "remote-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "valid-ns/valid-cr/valid-uid",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	// Resolver says the owner exists
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role still exists with the annotation intact
+	gotRole := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "remote-ns",
+	}, gotRole); err != nil {
+		t.Fatalf("expected Role to still exist: %v", err)
+	}
+	annotation := gotRole.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation preserved as %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_MixedEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "remote-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "valid-ns/valid-cr/valid-uid,stale-ns/stale-cr/stale-uid",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	// Only the first entry is valid
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted (valid owner remains), got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role still exists with only the valid annotation
+	gotRole := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "remote-ns",
+	}, gotRole); err != nil {
+		t.Fatalf("expected Role to still exist: %v", err)
+	}
+	annotation := gotRole.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation to be %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+	if strings.Contains(annotation, "stale") {
+		t.Errorf("expected stale entry to be removed, got %q", annotation)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_DeletesResourceWithNoOwners(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Role with only stale annotation entries AND no OwnerReferences
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "orphan-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "stale-ns/stale-cr/stale-uid",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{}) // nothing is valid
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 1 {
+		t.Errorf("expected 1 resource deleted, got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role is deleted
+	gotRole := &rbacv1.Role{}
+	err = scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "orphan-ns",
+	}, gotRole)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_KeepsResourceWithOwnerRefs(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Role with stale annotation entries BUT still has an OwnerReference
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "ownerref-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "stale-ns/stale-cr/stale-uid",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "test.example.com/v1alpha1",
+					Kind:       "TestResource",
+					Name:       "local-cr",
+					UID:        types.UID("local-uid"),
+				},
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{}) // annotation owner is stale
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted (OwnerRef still present), got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role still exists but annotation is cleaned
+	gotRole := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "ownerref-ns",
+	}, gotRole); err != nil {
+		t.Fatalf("expected Role to still exist: %v", err)
+	}
+	annotations := gotRole.GetAnnotations()
+	if _, has := annotations[ownerAnnotationKey]; has {
+		t.Errorf("expected owner annotation to be removed, got %q", annotations[ownerAnnotationKey])
+	}
+	if len(gotRole.OwnerReferences) != 1 {
+		t.Errorf("expected OwnerReference to be preserved, got %d refs", len(gotRole.OwnerReferences))
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_RemovesMalformedEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Role with malformed annotation entries (missing UID, bad format)
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "malformed-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "bad,ns/name,valid-ns/valid-cr/valid-uid",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 2 {
+		t.Errorf("expected 2 malformed entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted (valid owner remains), got %d", result.ResourcesDeleted)
+	}
+
+	// Verify Role still exists with only the valid annotation
+	gotRole := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "malformed-ns",
+	}, gotRole); err != nil {
+		t.Fatalf("expected Role to still exist: %v", err)
+	}
+	annotation := gotRole.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation to be %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_NoOpWhenClean(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Role with a valid annotation entry
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "clean-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "valid-ns/valid-cr/valid-uid",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 1 {
+		t.Errorf("expected 1 resource scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_NoManagedResources(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 0 {
+		t.Errorf("expected 0 resources scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}
+
+func TestGarbageCollectOrphanedOwners_NoAnnotations(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Role with labels but no annotations
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-operator-scoped-access",
+			Namespace: "no-annotation-ns",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "rbac-scoper",
+			},
+		},
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(s).WithObjects(role)
+	scoper := newTestScoper(t, s, builder)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 1 {
+		t.Errorf("expected 1 resource scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}

@@ -3,6 +3,7 @@ package rbacscope
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -237,4 +238,129 @@ func (s *ClusterRBACScoper) cleanupClusterResource(
 	}
 	log.Info("removed owner annotation from "+kind+" (other owners remain)", "name", key.Name)
 	return nil
+}
+
+// GarbageCollectOrphanedOwners checks the single ClusterRole and
+// ClusterRoleBinding managed by this scoper, resolves each annotation
+// owner entry against the resolver, and removes entries for owners that
+// no longer exist. Resources with no remaining annotation owners are deleted.
+//
+// Call this periodically (e.g., on a timer or during leader election start)
+// to clean up stale entries left by force-deleted CRs or controller crashes.
+func (s *ClusterRBACScoper) GarbageCollectOrphanedOwners(
+	ctx context.Context,
+	resolver OwnerResolver,
+) (GCResult, error) {
+	var result GCResult
+
+	// GC ClusterRole
+	cr := &rbacv1.ClusterRole{}
+	if err := s.client.Get(ctx, types.NamespacedName{Name: s.clusterRoleName()}, cr); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return result, fmt.Errorf("getting ClusterRole %s: %w", s.clusterRoleName(), err)
+		}
+	} else {
+		result.ResourcesScanned++
+		removed, deleted, err := s.gcClusterAnnotationOwners(ctx, cr, resolver, "ClusterRole")
+		if err != nil {
+			return result, err
+		}
+		result.EntriesRemoved += removed
+		if deleted {
+			result.ResourcesDeleted++
+		}
+	}
+
+	// GC ClusterRoleBinding
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := s.client.Get(ctx, types.NamespacedName{Name: s.clusterRoleBindingName()}, crb); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return result, fmt.Errorf("getting ClusterRoleBinding %s: %w", s.clusterRoleBindingName(), err)
+		}
+	} else {
+		result.ResourcesScanned++
+		removed, deleted, err := s.gcClusterAnnotationOwners(ctx, crb, resolver, "ClusterRoleBinding")
+		if err != nil {
+			return result, err
+		}
+		result.EntriesRemoved += removed
+		if deleted {
+			result.ResourcesDeleted++
+		}
+	}
+
+	return result, nil
+}
+
+// gcClusterAnnotationOwners parses annotation owner entries on obj, resolves
+// each via the resolver, removes stale or malformed entries, and deletes the
+// resource if no annotation owners remain. Unlike RBACScoper.gcAnnotationOwners,
+// this does not check OwnerReferences because ClusterRBACScoper never uses them.
+func (s *ClusterRBACScoper) gcClusterAnnotationOwners(
+	ctx context.Context,
+	obj client.Object,
+	resolver OwnerResolver,
+	kind string,
+) (removed int, deleted bool, err error) {
+	log := ctrl.LoggerFrom(ctx)
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return 0, false, nil
+	}
+	existing := annotations[s.ownerTracker.annotationKey]
+	if existing == "" {
+		return 0, false, nil
+	}
+
+	entries := gcSplitAnnotationEntries(existing)
+	var validEntries []string
+	for _, entry := range entries {
+		parts := gcParseOwnerEntry(entry)
+		if parts == nil {
+			log.Info("removing malformed annotation entry", "entry", entry, "kind", kind, "name", obj.GetName())
+			removed++
+			continue
+		}
+		ns, name, uid := parts[0], parts[1], types.UID(parts[2])
+		exists, resolveErr := resolver(ctx, ns, name, uid)
+		if resolveErr != nil {
+			return removed, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
+		}
+		if !exists {
+			log.Info("removing orphaned annotation entry", "entry", entry, "kind", kind, "name", obj.GetName())
+			removed++
+			continue
+		}
+		validEntries = append(validEntries, entry)
+	}
+
+	if removed == 0 {
+		return 0, false, nil
+	}
+
+	// Update the annotation
+	if len(validEntries) == 0 {
+		delete(annotations, s.ownerTracker.annotationKey)
+	} else {
+		annotations[s.ownerTracker.annotationKey] = strings.Join(validEntries, ",")
+	}
+	obj.SetAnnotations(annotations)
+
+	// ClusterRBACScoper never uses OwnerReferences, so only check annotation owners
+	if len(validEntries) == 0 {
+		if delErr := s.client.Delete(ctx, obj); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return removed, false, fmt.Errorf("deleting %s %s: %w", kind, obj.GetName(), delErr)
+		}
+		log.Info("deleted "+kind+" during GC (no owners remain)", "name", obj.GetName())
+		return removed, true, nil
+	}
+
+	if err := s.client.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return removed, false, nil
+		}
+		return removed, false, fmt.Errorf("updating %s %s during GC: %w", kind, obj.GetName(), err)
+	}
+	log.Info("removed stale annotation entries from "+kind, "name", obj.GetName(), "removed", removed)
+	return removed, false, nil
 }

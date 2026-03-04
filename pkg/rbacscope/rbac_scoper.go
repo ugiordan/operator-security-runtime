@@ -267,6 +267,59 @@ func (s *RBACScoper) removeOwnerRef(obj client.Object, owner client.Object) {
 	obj.SetOwnerReferences(filtered)
 }
 
+// CleanupAccessInNamespace removes the owner's references from the Role
+// and RoleBinding in targetNS. If targetNS equals the owner's namespace,
+// delegates to CleanupAccess (OwnerReference-based). Otherwise, uses
+// annotation-based ownership removal. Deletes resources if no owners remain.
+func (s *RBACScoper) CleanupAccessInNamespace(
+	ctx context.Context,
+	owner client.Object,
+	targetNS string,
+) error {
+	if owner.GetNamespace() == "" {
+		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
+			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
+	}
+	if targetNS == "" {
+		return fmt.Errorf("targetNS must not be empty")
+	}
+
+	// Same-namespace: delegate to CleanupAccess (OwnerReference-based)
+	if targetNS == owner.GetNamespace() {
+		return s.CleanupAccess(ctx, owner)
+	}
+
+	// Cross-namespace: use Get-based cleanup with annotation ownership
+	roleKey := types.NamespacedName{Name: s.roleName(), Namespace: targetNS}
+	role := &rbacv1.Role{}
+	if err := s.cleanupCrossNSResource(ctx, role, roleKey, owner, "Role"); err != nil {
+		return err
+	}
+
+	rbKey := types.NamespacedName{Name: s.roleBindingName(), Namespace: targetNS}
+	rb := &rbacv1.RoleBinding{}
+	return s.cleanupCrossNSResource(ctx, rb, rbKey, owner, "RoleBinding")
+}
+
+// cleanupCrossNSResource fetches a resource by key and delegates to
+// cleanupManagedResource for ownership removal and conditional deletion.
+// Returns nil if the resource is not found.
+func (s *RBACScoper) cleanupCrossNSResource(
+	ctx context.Context,
+	obj client.Object,
+	key types.NamespacedName,
+	owner client.Object,
+	kind string,
+) error {
+	if err := s.client.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("getting %s %s: %w", kind, key, err)
+	}
+	return s.cleanupManagedResource(ctx, obj, owner, &s.ownerTracker, kind)
+}
+
 // EnsureAccessInNamespace creates/updates a Role and RoleBinding in
 // targetNS for the owner. Uses annotation-based ownership because
 // cross-namespace OwnerReferences are not supported by Kubernetes.
@@ -317,11 +370,164 @@ func (s *RBACScoper) EnsureAccessInNamespace(
 	return nil
 }
 
-// TODO(Phase 3+): Implement GarbageCollectOrphanedOwners to handle
-// force-deleted CRs, controller crashes during cleanup, and annotation
-// corruption. The GC should list managed resources by label, parse
-// annotation entries, resolve each to a CR, and remove stale entries.
-// See design doc Section 3.4.
+// GarbageCollectOrphanedOwners scans all managed Roles and RoleBindings,
+// checks each annotation owner entry against the resolver, and removes
+// entries for owners that no longer exist. Resources with no remaining
+// owners (no OwnerReferences AND no annotation entries) are deleted.
+//
+// Call this periodically (e.g., on a timer or during leader election start)
+// to clean up stale entries left by force-deleted CRs or controller crashes.
+func (s *RBACScoper) GarbageCollectOrphanedOwners(
+	ctx context.Context,
+	resolver OwnerResolver,
+) (GCResult, error) {
+	var result GCResult
+
+	// GC Roles
+	roleList := &rbacv1.RoleList{}
+	listOpts := []client.ListOption{
+		client.MatchingLabels(s.labels()),
+		client.Limit(cleanupListPageSize),
+	}
+	for {
+		if err := s.client.List(ctx, roleList, listOpts...); err != nil {
+			return result, fmt.Errorf("listing managed Roles: %w", err)
+		}
+		for i := range roleList.Items {
+			if roleList.Items[i].Name != s.roleName() {
+				continue
+			}
+			result.ResourcesScanned++
+			removed, deleted, err := s.gcAnnotationOwners(ctx, &roleList.Items[i], resolver, "Role")
+			if err != nil {
+				return result, err
+			}
+			result.EntriesRemoved += removed
+			if deleted {
+				result.ResourcesDeleted++
+			}
+		}
+		if roleList.Continue == "" {
+			break
+		}
+		listOpts = []client.ListOption{
+			client.MatchingLabels(s.labels()),
+			client.Limit(cleanupListPageSize),
+			client.Continue(roleList.Continue),
+		}
+	}
+
+	// GC RoleBindings
+	rbList := &rbacv1.RoleBindingList{}
+	listOpts = []client.ListOption{
+		client.MatchingLabels(s.labels()),
+		client.Limit(cleanupListPageSize),
+	}
+	for {
+		if err := s.client.List(ctx, rbList, listOpts...); err != nil {
+			return result, fmt.Errorf("listing managed RoleBindings: %w", err)
+		}
+		for i := range rbList.Items {
+			if rbList.Items[i].Name != s.roleBindingName() {
+				continue
+			}
+			result.ResourcesScanned++
+			removed, deleted, err := s.gcAnnotationOwners(ctx, &rbList.Items[i], resolver, "RoleBinding")
+			if err != nil {
+				return result, err
+			}
+			result.EntriesRemoved += removed
+			if deleted {
+				result.ResourcesDeleted++
+			}
+		}
+		if rbList.Continue == "" {
+			break
+		}
+		listOpts = []client.ListOption{
+			client.MatchingLabels(s.labels()),
+			client.Limit(cleanupListPageSize),
+			client.Continue(rbList.Continue),
+		}
+	}
+
+	return result, nil
+}
+
+// gcAnnotationOwners parses annotation owner entries on obj, resolves each
+// via the resolver, removes stale or malformed entries, and deletes the
+// resource if no owners remain (no OwnerReferences AND no annotation entries).
+func (s *RBACScoper) gcAnnotationOwners(
+	ctx context.Context,
+	obj client.Object,
+	resolver OwnerResolver,
+	kind string,
+) (removed int, deleted bool, err error) {
+	log := ctrl.LoggerFrom(ctx)
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return 0, false, nil
+	}
+	existing := annotations[s.ownerTracker.annotationKey]
+	if existing == "" {
+		return 0, false, nil
+	}
+
+	entries := gcSplitAnnotationEntries(existing)
+	var validEntries []string
+	for _, entry := range entries {
+		parts := gcParseOwnerEntry(entry)
+		if parts == nil {
+			log.Info("removing malformed annotation entry", "entry", entry, "kind", kind, "namespace", obj.GetNamespace())
+			removed++
+			continue
+		}
+		ns, name, uid := parts[0], parts[1], types.UID(parts[2])
+		exists, resolveErr := resolver(ctx, ns, name, uid)
+		if resolveErr != nil {
+			return removed, false, fmt.Errorf("resolving owner %s: %w", entry, resolveErr)
+		}
+		if !exists {
+			log.Info("removing orphaned annotation entry", "entry", entry, "kind", kind, "namespace", obj.GetNamespace())
+			removed++
+			continue
+		}
+		validEntries = append(validEntries, entry)
+	}
+
+	if removed == 0 {
+		return 0, false, nil
+	}
+
+	// Update the annotation
+	if len(validEntries) == 0 {
+		delete(annotations, s.ownerTracker.annotationKey)
+	} else {
+		annotations[s.ownerTracker.annotationKey] = gcJoinAnnotationEntries(validEntries)
+	}
+	obj.SetAnnotations(annotations)
+
+	// Check if any owners remain
+	hasOwnerRefs := len(obj.GetOwnerReferences()) > 0
+	hasAnnotationOwners := len(validEntries) > 0
+
+	if !hasOwnerRefs && !hasAnnotationOwners {
+		if delErr := s.client.Delete(ctx, obj); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return removed, false, fmt.Errorf("deleting %s %s/%s: %w", kind, obj.GetNamespace(), obj.GetName(), delErr)
+		}
+		log.Info("deleted "+kind+" during GC (no owners remain)", "namespace", obj.GetNamespace())
+		return removed, true, nil
+	}
+
+	if err := s.client.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return removed, false, nil
+		}
+		return removed, false, fmt.Errorf("updating %s %s/%s during GC: %w", kind, obj.GetNamespace(), obj.GetName(), err)
+	}
+	log.Info("removed stale annotation entries from "+kind, "namespace", obj.GetNamespace(), "removed", removed)
+	return removed, false, nil
+}
 
 // CleanupAllAccess removes the owner's references from all managed
 // Roles and RoleBindings across namespaces. Uses label-selected listing

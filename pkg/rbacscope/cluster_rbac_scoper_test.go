@@ -678,3 +678,235 @@ func TestEnsureClusterAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T)
 		t.Errorf("expected 0 rules with AllowAllRules, got %d", len(clusterRole.Rules))
 	}
 }
+
+// --- ClusterRBACScoper GarbageCollectOrphanedOwners Tests ---
+
+func TestClusterGarbageCollectOrphanedOwners_RemovesStaleEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Pre-create ClusterRole and ClusterRoleBinding with stale annotation entries
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+		},
+	}
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access-binding",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "test-operator-cluster-scoped-access",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr, crb).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 2 {
+		t.Errorf("expected 2 resources scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 2 {
+		t.Errorf("expected 2 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 2 {
+		t.Errorf("expected 2 resources deleted, got %d", result.ResourcesDeleted)
+	}
+
+	// Verify ClusterRole is deleted
+	gotCR := &rbacv1.ClusterRole{}
+	crErr := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR)
+	if !apierrors.IsNotFound(crErr) {
+		t.Errorf("expected ClusterRole to be deleted, got err=%v", crErr)
+	}
+
+	// Verify ClusterRoleBinding is deleted
+	gotCRB := &rbacv1.ClusterRoleBinding{}
+	crbErr := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access-binding"}, gotCRB)
+	if !apierrors.IsNotFound(crbErr) {
+		t.Errorf("expected ClusterRoleBinding to be deleted, got err=%v", crbErr)
+	}
+}
+
+func TestClusterGarbageCollectOrphanedOwners_PreservesValidEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "valid-ns/valid-cr/valid-uid",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+
+	gotCR := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR); err != nil {
+		t.Fatalf("expected ClusterRole to still exist: %v", err)
+	}
+	annotation := gotCR.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation preserved as %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+}
+
+func TestClusterGarbageCollectOrphanedOwners_MixedEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "valid-ns/valid-cr/valid-uid,stale-ns/stale-cr/stale-uid",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+
+	gotCR := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR); err != nil {
+		t.Fatalf("expected ClusterRole to still exist: %v", err)
+	}
+	annotation := gotCR.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation to be %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+}
+
+func TestClusterGarbageCollectOrphanedOwners_RemovesMalformedEntries(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "bad,ns/name,valid-ns/valid-cr/valid-uid",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	resolver := newTestResolver(map[string]bool{
+		"valid-ns/valid-cr/valid-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 2 {
+		t.Errorf("expected 2 malformed entries removed, got %d", result.EntriesRemoved)
+	}
+
+	gotCR := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR); err != nil {
+		t.Fatalf("expected ClusterRole to still exist: %v", err)
+	}
+	annotation := gotCR.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "valid-ns/valid-cr/valid-uid" {
+		t.Errorf("expected annotation to be %q, got %q", "valid-ns/valid-cr/valid-uid", annotation)
+	}
+}
+
+func TestClusterGarbageCollectOrphanedOwners_NotFoundNoError(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.ResourcesScanned != 0 {
+		t.Errorf("expected 0 resources scanned, got %d", result.ResourcesScanned)
+	}
+	if result.EntriesRemoved != 0 {
+		t.Errorf("expected 0 entries removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}
