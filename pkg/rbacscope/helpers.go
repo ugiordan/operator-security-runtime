@@ -179,6 +179,13 @@ func validateCoreInputs(
 	if err := validateDNS1123Subdomain("OperatorIdentity.Name", identity.Name); err != nil {
 		return scopeConfig{}, nil, err
 	}
+	// Generated resource names append suffixes (longest: "-cluster-scoped-access-binding"
+	// = 30 chars). Limit operator name so the total stays within 253.
+	const maxOperatorNameLen = 253 - 30 // 223
+	if len(identity.Name) > maxOperatorNameLen {
+		return scopeConfig{}, nil, fmt.Errorf("OperatorIdentity.Name must be no more than %d characters "+
+			"(generated resource names add up to 30 characters): got %d", maxOperatorNameLen, len(identity.Name))
+	}
 	if err := validateDNS1123Subdomain("OperatorIdentity.ServiceAccount", identity.ServiceAccount); err != nil {
 		return scopeConfig{}, nil, err
 	}

@@ -778,6 +778,16 @@ func TestNewRBACScoper_DNS1123Validation(t *testing.T) {
 			errMsg:  "OperatorIdentity.Name must be no more than 253 characters",
 		},
 		{
+			name: "Name exceeds generated resource name limit",
+			identity: OperatorIdentity{
+				Name:           strings.Repeat("a", 224), // 224 > 223 max (253 - 30 suffix chars)
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be no more than 223 characters",
+		},
+		{
 			name: "Name starting with hyphen",
 			identity: OperatorIdentity{
 				Name:           "-my-operator",
@@ -925,16 +935,12 @@ func TestNewRBACScoper_WithOptions(t *testing.T) {
 		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
 		allowed,
 		WithDeniedNamespaces("custom-ns"),
-		WithAggregationLabelCheck(true),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(scoper.config.deniedNamespaces) != 1 || scoper.config.deniedNamespaces[0] != "custom-ns" {
 		t.Errorf("expected deniedNamespaces = [custom-ns], got %v", scoper.config.deniedNamespaces)
-	}
-	if !scoper.config.aggregationLabelCheck {
-		t.Error("expected aggregationLabelCheck = true")
 	}
 }
 

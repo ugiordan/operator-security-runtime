@@ -13,7 +13,6 @@ func (f optionFunc) apply(s *scopeConfig) { f(s) }
 type scopeConfig struct {
 	deniedNamespaces         []string
 	deniedNamespacesModified bool // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
-	aggregationLabelCheck    bool
 }
 
 func defaultScopeConfig() scopeConfig {
@@ -22,7 +21,6 @@ func defaultScopeConfig() scopeConfig {
 			"kube-system", "kube-public", "kube-node-lease", "default",
 			"openshift-", // prefix match: any namespace starting with "openshift-"
 		},
-		aggregationLabelCheck: false,
 	}
 }
 
@@ -48,13 +46,5 @@ func WithAdditionalDeniedNamespaces(namespaces ...string) Option {
 	return optionFunc(func(s *scopeConfig) {
 		s.deniedNamespaces = append(s.deniedNamespaces, namespaces...)
 		s.deniedNamespacesModified = true
-	})
-}
-
-// WithAggregationLabelCheck enables or disables the aggregation label
-// check on ClusterRoles.
-func WithAggregationLabelCheck(enabled bool) Option {
-	return optionFunc(func(s *scopeConfig) {
-		s.aggregationLabelCheck = enabled
 	})
 }
