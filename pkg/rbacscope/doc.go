@@ -6,23 +6,34 @@
 //
 // This replaces static cluster-wide resource access (via ClusterRole) with
 // namespace-scoped grants tied to CR lifecycle, following the principle of least
-// privilege. The Rules field accepts any []rbacv1.PolicyRule, supporting
+// privilege. AllowedRules accepts any []rbacv1.PolicyRule, supporting
 // arbitrary combinations of API groups, resources, and verbs.
+//
+// For operators whose static RBAC (via ClusterRole) already sufficiently constrains
+// access, AllowAllRules can be used as an explicit escape hatch that bypasses the
+// ceiling enforcement. This allows RBACScoper to manage the namespace-scoped Role
+// and RoleBinding lifecycle without enforcing a specific permission set.
 //
 // Usage:
 //
-//	scoper := &rbacscope.RBACScoper{
-//	    Client:              mgr.GetClient(),
-//	    Scheme:              mgr.GetScheme(),
-//	    OperatorName:        "my-operator",
-//	    OperatorSAName:      "my-operator-controller-manager",
-//	    OperatorSANamespace: "my-operator-system",
-//	    Rules: []rbacv1.PolicyRule{{
-//	        APIGroups: []string{""},
-//	        Resources: []string{"secrets"},
-//	        Verbs:     []string{"get", "list", "watch"},
-//	    }},
-//	}
+//	allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
+//	    APIGroups: []string{""},
+//	    Resources: []string{"secrets"},
+//	    Verbs:     []string{"get", "list", "watch"},
+//	})
+//	if err != nil { ... }
+//
+//	scoper, err := rbacscope.NewRBACScoper(
+//	    mgr.GetClient(),
+//	    mgr.GetScheme(),
+//	    rbacscope.OperatorIdentity{
+//	        Name:           "my-operator",
+//	        ServiceAccount: "my-operator-controller-manager",
+//	        Namespace:      "my-operator-system",
+//	    },
+//	    allowed,
+//	)
+//	if err != nil { ... }
 //
 //	// In your reconciler:
 //	if err := scoper.EnsureAccess(ctx, cr); err != nil { ... }

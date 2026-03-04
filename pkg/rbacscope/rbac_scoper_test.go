@@ -51,19 +51,30 @@ func testScheme() *runtime.Scheme {
 	return s
 }
 
-func newTestScoper(s *runtime.Scheme, cl *fake.ClientBuilder) *RBACScoper {
-	return &RBACScoper{
-		Client:              cl.Build(),
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-operator-sa",
-		OperatorSANamespace: "operator-system",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
+func newTestScoper(t *testing.T, s *runtime.Scheme, cl *fake.ClientBuilder) *RBACScoper {
+	t.Helper()
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules failed: %v", err)
 	}
+	scoper, err := NewRBACScoper(
+		cl.Build(),
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper failed: %v", err)
+	}
+	return scoper
 }
 
 func newTestCR() *testResource {
@@ -81,7 +92,7 @@ func newTestCR() *testResource {
 func TestEnsureAccess_CreatesRoleAndRoleBinding(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -91,7 +102,7 @@ func TestEnsureAccess_CreatesRoleAndRoleBinding(t *testing.T) {
 
 	// Verify Role was created
 	role := &rbacv1.Role{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access",
 		Namespace: "target-ns",
 	}, role); err != nil {
@@ -147,7 +158,7 @@ func TestEnsureAccess_CreatesRoleAndRoleBinding(t *testing.T) {
 
 	// Verify RoleBinding was created
 	rb := &rbacv1.RoleBinding{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access-binding",
 		Namespace: "target-ns",
 	}, rb); err != nil {
@@ -207,7 +218,7 @@ func TestEnsureAccess_CreatesRoleAndRoleBinding(t *testing.T) {
 func TestEnsureAccess_Idempotent(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -223,7 +234,7 @@ func TestEnsureAccess_Idempotent(t *testing.T) {
 
 	// Verify Role still exists
 	role := &rbacv1.Role{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access",
 		Namespace: "target-ns",
 	}, role); err != nil {
@@ -232,7 +243,7 @@ func TestEnsureAccess_Idempotent(t *testing.T) {
 
 	// Verify RoleBinding still exists
 	rb := &rbacv1.RoleBinding{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access-binding",
 		Namespace: "target-ns",
 	}, rb); err != nil {
@@ -243,18 +254,30 @@ func TestEnsureAccess_Idempotent(t *testing.T) {
 func TestEnsureAccess_CustomRules(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := &RBACScoper{
-		Client:              builder.Build(),
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-operator-sa",
-		OperatorSANamespace: "operator-system",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "create", "update"},
-		}},
+
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get", "create", "update"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules returned error: %v", err)
 	}
+
+	scoper, err := NewRBACScoper(
+		builder.Build(),
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper returned error: %v", err)
+	}
+
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -263,7 +286,7 @@ func TestEnsureAccess_CustomRules(t *testing.T) {
 	}
 
 	role := &rbacv1.Role{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access",
 		Namespace: "target-ns",
 	}, role); err != nil {
@@ -288,7 +311,7 @@ func TestEnsureAccess_CustomRules(t *testing.T) {
 func TestCleanupAccess_DeletesRoleAndRoleBinding(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -304,7 +327,7 @@ func TestCleanupAccess_DeletesRoleAndRoleBinding(t *testing.T) {
 
 	// Verify Role is gone
 	role := &rbacv1.Role{}
-	err := scoper.Client.Get(ctx, types.NamespacedName{
+	err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access",
 		Namespace: "target-ns",
 	}, role)
@@ -314,7 +337,7 @@ func TestCleanupAccess_DeletesRoleAndRoleBinding(t *testing.T) {
 
 	// Verify RoleBinding is gone
 	rb := &rbacv1.RoleBinding{}
-	err = scoper.Client.Get(ctx, types.NamespacedName{
+	err = scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access-binding",
 		Namespace: "target-ns",
 	}, rb)
@@ -326,7 +349,7 @@ func TestCleanupAccess_DeletesRoleAndRoleBinding(t *testing.T) {
 func TestCleanupAccess_NoErrorWhenAlreadyGone(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -339,7 +362,7 @@ func TestCleanupAccess_NoErrorWhenAlreadyGone(t *testing.T) {
 func TestMultipleCRsInSameNamespace(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	ctx := context.Background()
 
 	cr1 := &testResource{
@@ -370,7 +393,7 @@ func TestMultipleCRsInSameNamespace(t *testing.T) {
 
 	// Verify Role has TWO OwnerReferences
 	role := &rbacv1.Role{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name: "test-operator-scoped-access", Namespace: "shared-ns",
 	}, role); err != nil {
 		t.Fatalf("expected Role to exist: %v", err)
@@ -385,7 +408,7 @@ func TestMultipleCRsInSameNamespace(t *testing.T) {
 	}
 
 	// Verify Role still exists with 1 OwnerReference
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name: "test-operator-scoped-access", Namespace: "shared-ns",
 	}, role); err != nil {
 		t.Fatal("Role was deleted when another CR still owns it")
@@ -402,7 +425,7 @@ func TestMultipleCRsInSameNamespace(t *testing.T) {
 		t.Fatalf("CleanupAccess for cr2 failed: %v", err)
 	}
 
-	err := scoper.Client.Get(ctx, types.NamespacedName{
+	err := scoper.client.Get(ctx, types.NamespacedName{
 		Name: "test-operator-scoped-access", Namespace: "shared-ns",
 	}, role)
 	if err == nil {
@@ -413,25 +436,37 @@ func TestMultipleCRsInSameNamespace(t *testing.T) {
 func TestEnsureAccess_MultiResourceRules(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := &RBACScoper{
-		Client:              builder.Build(),
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-operator-sa",
-		OperatorSANamespace: "operator-system",
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"secrets"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"configmaps"},
-				Verbs:     []string{"get", "list"},
-			},
+
+	allowed, err := NewAllowedRules(
+		rbacv1.PolicyRule{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get", "list", "watch"},
 		},
+		rbacv1.PolicyRule{
+			APIGroups: []string{""},
+			Resources: []string{"configmaps"},
+			Verbs:     []string{"get", "list"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewAllowedRules returned error: %v", err)
 	}
+
+	scoper, err := NewRBACScoper(
+		builder.Build(),
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper returned error: %v", err)
+	}
+
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -441,7 +476,7 @@ func TestEnsureAccess_MultiResourceRules(t *testing.T) {
 
 	// Verify Role was created with both rules
 	role := &rbacv1.Role{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access",
 		Namespace: "target-ns",
 	}, role); err != nil {
@@ -482,7 +517,7 @@ func TestEnsureAccess_MultiResourceRules(t *testing.T) {
 
 	// Verify RoleBinding was created
 	rb := &rbacv1.RoleBinding{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access-binding",
 		Namespace: "target-ns",
 	}, rb); err != nil {
@@ -499,23 +534,36 @@ func TestEnsureAccess_RuleUpdateConvergence(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
 	cl := builder.Build()
-	scoper := &RBACScoper{
-		Client:              cl,
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-operator-sa",
-		OperatorSANamespace: "operator-system",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
+
+	// First scoper: secrets only
+	allowed1, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules returned error: %v", err)
 	}
+
+	scoper1, err := NewRBACScoper(
+		cl,
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed1,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper returned error: %v", err)
+	}
+
 	cr := newTestCR()
 	ctx := context.Background()
 
 	// First call: secrets only
-	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+	if err := scoper1.EnsureAccess(ctx, cr); err != nil {
 		t.Fatalf("first EnsureAccess returned error: %v", err)
 	}
 
@@ -529,22 +577,39 @@ func TestEnsureAccess_RuleUpdateConvergence(t *testing.T) {
 		t.Fatalf("expected 1 rule after first call, got %d", len(role.Rules))
 	}
 
-	// Reconfigure scoper to include configmaps
-	scoper.Rules = []rbacv1.PolicyRule{
-		{
+	// Second scoper: secrets + configmaps (simulates configuration change)
+	allowed2, err := NewAllowedRules(
+		rbacv1.PolicyRule{
 			APIGroups: []string{""},
 			Resources: []string{"secrets"},
 			Verbs:     []string{"get", "list", "watch"},
 		},
-		{
+		rbacv1.PolicyRule{
 			APIGroups: []string{""},
 			Resources: []string{"configmaps"},
 			Verbs:     []string{"get", "list"},
 		},
+	)
+	if err != nil {
+		t.Fatalf("NewAllowedRules returned error: %v", err)
+	}
+
+	scoper2, err := NewRBACScoper(
+		cl,
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed2,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper returned error: %v", err)
 	}
 
 	// Second call: should update the Role with 2 rules
-	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+	if err := scoper2.EnsureAccess(ctx, cr); err != nil {
 		t.Fatalf("second EnsureAccess returned error: %v", err)
 	}
 
@@ -561,118 +626,164 @@ func TestEnsureAccess_RuleUpdateConvergence(t *testing.T) {
 	}
 }
 
-func TestEnsureAccess_ValidationErrors(t *testing.T) {
+func TestNewRBACScoper_ValidationErrors(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
 	cl := builder.Build()
-	ctx := context.Background()
-	cr := newTestCR()
+
+	validRules, _ := NewAllowedRules(rbacv1.PolicyRule{Verbs: []string{"get"}})
 
 	tests := []struct {
-		name    string
-		scoper *RBACScoper
-		errMsg string
+		name     string
+		cl       client.Client
+		scheme   *runtime.Scheme
+		identity OperatorIdentity
+		allowed  AllowedRules
+		errMsg   string
 	}{
 		{
-			name: "nil Client",
-			scoper: &RBACScoper{
-				Client:              nil,
-				Scheme:              s,
-				OperatorName:        "test",
-				OperatorSAName:      "test-sa",
-				OperatorSANamespace: "test-ns",
-				Rules:               []rbacv1.PolicyRule{{Verbs: []string{"get"}}},
+			name:   "nil client",
+			cl:     nil,
+			scheme: s,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
 			},
-			errMsg: "Client must not be nil",
+			allowed: validRules,
+			errMsg:  "client must not be nil",
 		},
 		{
-			name: "nil Scheme",
-			scoper: &RBACScoper{
-				Client:              cl,
-				Scheme:              nil,
-				OperatorName:        "test",
-				OperatorSAName:      "test-sa",
-				OperatorSANamespace: "test-ns",
-				Rules:               []rbacv1.PolicyRule{{Verbs: []string{"get"}}},
+			name:   "nil scheme",
+			cl:     cl,
+			scheme: nil,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
 			},
-			errMsg: "Scheme must not be nil",
+			allowed: validRules,
+			errMsg:  "scheme must not be nil",
 		},
 		{
-			name: "empty OperatorName",
-			scoper: &RBACScoper{
-				Client:              cl,
-				Scheme:              s,
-				OperatorName:        "",
-				OperatorSAName:      "test-sa",
-				OperatorSANamespace: "test-ns",
-				Rules:               []rbacv1.PolicyRule{{Verbs: []string{"get"}}},
+			name:   "empty Name",
+			cl:     cl,
+			scheme: s,
+			identity: OperatorIdentity{
+				Name:           "",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
 			},
-			errMsg: "OperatorName must not be empty",
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.Name must not be empty",
 		},
 		{
-			name: "empty OperatorSAName",
-			scoper: &RBACScoper{
-				Client:              cl,
-				Scheme:              s,
-				OperatorName:        "test",
-				OperatorSAName:      "",
-				OperatorSANamespace: "test-ns",
-				Rules:               []rbacv1.PolicyRule{{Verbs: []string{"get"}}},
+			name:   "empty ServiceAccount",
+			cl:     cl,
+			scheme: s,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "",
+				Namespace:      "test-ns",
 			},
-			errMsg: "OperatorSAName must not be empty",
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.ServiceAccount must not be empty",
 		},
 		{
-			name: "empty OperatorSANamespace",
-			scoper: &RBACScoper{
-				Client:              cl,
-				Scheme:              s,
-				OperatorName:        "test",
-				OperatorSAName:      "test-sa",
-				OperatorSANamespace: "",
-				Rules:               []rbacv1.PolicyRule{{Verbs: []string{"get"}}},
+			name:   "empty Namespace",
+			cl:     cl,
+			scheme: s,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "",
 			},
-			errMsg: "OperatorSANamespace must not be empty",
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.Namespace must not be empty",
 		},
 		{
-			name: "empty Rules",
-			scoper: &RBACScoper{
-				Client:              cl,
-				Scheme:              s,
-				OperatorName:        "test",
-				OperatorSAName:      "test-sa",
-				OperatorSANamespace: "test-ns",
-				Rules:               nil,
+			name:   "empty AllowedRules",
+			cl:     cl,
+			scheme: s,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
 			},
-			errMsg: "Rules must not be empty",
+			allowed: AllowedRules{}, // zero-value: no rules and allowAll=false
+			errMsg:  "AllowedRules must not be empty",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.scoper.EnsureAccess(ctx, cr)
+			_, err := NewRBACScoper(tt.cl, tt.scheme, tt.identity, tt.allowed)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
 			if !strings.Contains(err.Error(), tt.errMsg) {
 				t.Errorf("expected error containing %q, got %q", tt.errMsg, err.Error())
 			}
-
-			// CleanupAccess should return the same validation error
-			err = tt.scoper.CleanupAccess(ctx, cr)
-			if err == nil {
-				t.Fatal("expected error from CleanupAccess, got nil")
-			}
-			if !strings.Contains(err.Error(), tt.errMsg) {
-				t.Errorf("CleanupAccess: expected error containing %q, got %q", tt.errMsg, err.Error())
-			}
 		})
+	}
+}
+
+func TestNewAllowedRules_EmptyReturnsError(t *testing.T) {
+	_, err := NewAllowedRules()
+	if err == nil {
+		t.Fatal("expected error for empty NewAllowedRules, got nil")
+	}
+	if !strings.Contains(err.Error(), "at least one PolicyRule") {
+		t.Errorf("expected error about PolicyRule, got %q", err.Error())
+	}
+}
+
+func TestNewAllowedRules_DefensiveCopy(t *testing.T) {
+	rule := rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get"},
+	}
+	allowed, err := NewAllowedRules(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate the original rule
+	rule.Verbs = append(rule.Verbs, "*")
+	// Verify the AllowedRules was not affected
+	if len(allowed.rules[0].Verbs) != 1 || allowed.rules[0].Verbs[0] != "get" {
+		t.Errorf("AllowedRules was mutated: got verbs %v", allowed.rules[0].Verbs)
+	}
+}
+
+func TestNewRBACScoper_WithOptions(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	allowed, _ := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"},
+	})
+
+	scoper, err := NewRBACScoper(cl, s,
+		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
+		allowed,
+		WithDeniedNamespaces("custom-ns"),
+		WithAggregationLabelCheck(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoper.config.deniedNamespaces) != 1 || scoper.config.deniedNamespaces[0] != "custom-ns" {
+		t.Errorf("expected deniedNamespaces = [custom-ns], got %v", scoper.config.deniedNamespaces)
+	}
+	if !scoper.config.aggregationLabelCheck {
+		t.Error("expected aggregationLabelCheck = true")
 	}
 }
 
 func TestEnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	ctx := context.Background()
 
 	// Create a cluster-scoped resource (no namespace)
@@ -680,7 +791,7 @@ func TestEnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cluster-scoped-cr",
 			UID:  types.UID("cluster-uid"),
-			// No Namespace — cluster-scoped
+			// No Namespace -- cluster-scoped
 		},
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
@@ -744,7 +855,7 @@ func TestEnsureAccess_RoleBindingDriftRecovery(t *testing.T) {
 			},
 		})
 
-	scoper := newTestScoper(s, builder)
+	scoper := newTestScoper(t, s, builder)
 	cr := newTestCR()
 	ctx := context.Background()
 
@@ -755,7 +866,7 @@ func TestEnsureAccess_RoleBindingDriftRecovery(t *testing.T) {
 
 	// Verify the RoleBinding now has the correct RoleRef.
 	rb := &rbacv1.RoleBinding{}
-	if err := scoper.Client.Get(ctx, types.NamespacedName{
+	if err := scoper.client.Get(ctx, types.NamespacedName{
 		Name:      "test-operator-scoped-access-binding",
 		Namespace: "target-ns",
 	}, rb); err != nil {

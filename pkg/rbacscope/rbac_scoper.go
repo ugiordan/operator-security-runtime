@@ -18,59 +18,89 @@ import (
 // RoleBindings so that the operator ServiceAccount can access resources only
 // in namespaces where a CR exists.
 type RBACScoper struct {
-	Client              client.Client
-	Scheme              *runtime.Scheme
-	OperatorName        string
-	OperatorSAName      string
-	OperatorSANamespace string
-	Rules               []rbacv1.PolicyRule
+	client              client.Client
+	scheme              *runtime.Scheme
+	operatorName        string
+	operatorSAName      string
+	operatorSANamespace string
+	rules               []rbacv1.PolicyRule
+	config              scopeConfig
+}
+
+// NewRBACScoper creates a validated RBACScoper. All required parameters are
+// validated up front; if any are invalid the constructor returns an error.
+func NewRBACScoper(
+	cl client.Client,
+	scheme *runtime.Scheme,
+	identity OperatorIdentity,
+	allowed AllowedRules,
+	opts ...Option,
+) (*RBACScoper, error) {
+	if cl == nil {
+		return nil, fmt.Errorf("client must not be nil")
+	}
+	if scheme == nil {
+		return nil, fmt.Errorf("scheme must not be nil")
+	}
+	if identity.Name == "" {
+		return nil, fmt.Errorf("OperatorIdentity.Name must not be empty")
+	}
+	if identity.ServiceAccount == "" {
+		return nil, fmt.Errorf("OperatorIdentity.ServiceAccount must not be empty")
+	}
+	if identity.Namespace == "" {
+		return nil, fmt.Errorf("OperatorIdentity.Namespace must not be empty")
+	}
+	if !allowed.allowAll && len(allowed.rules) == 0 {
+		return nil, fmt.Errorf("AllowedRules must not be empty")
+	}
+
+	cfg := defaultScopeConfig()
+	for _, opt := range opts {
+		opt.apply(&cfg)
+	}
+
+	var rules []rbacv1.PolicyRule
+	if allowed.allowAll {
+		rules = nil // will be set per-call
+		ctrl.Log.Info("RBACScoper created with AllowAllRules - no ceiling enforcement",
+			"operatorName", identity.Name)
+	} else {
+		rules = make([]rbacv1.PolicyRule, len(allowed.rules))
+		for i := range allowed.rules {
+			rules[i] = *allowed.rules[i].DeepCopy()
+		}
+	}
+
+	return &RBACScoper{
+		client:              cl,
+		scheme:              scheme,
+		operatorName:        identity.Name,
+		operatorSAName:      identity.ServiceAccount,
+		operatorSANamespace: identity.Namespace,
+		rules:               rules,
+		config:              cfg,
+	}, nil
 }
 
 func (s *RBACScoper) roleName() string {
-	return fmt.Sprintf("%s-scoped-access", s.OperatorName)
+	return fmt.Sprintf("%s-scoped-access", s.operatorName)
 }
 
 func (s *RBACScoper) roleBindingName() string {
-	return fmt.Sprintf("%s-scoped-access-binding", s.OperatorName)
+	return fmt.Sprintf("%s-scoped-access-binding", s.operatorName)
 }
 
 func (s *RBACScoper) labels() map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/managed-by": s.OperatorName,
+		"app.kubernetes.io/managed-by": s.operatorName,
 		"app.kubernetes.io/component":  "rbac-scoper",
 	}
-}
-
-// validate checks that the RBACScoper is properly configured.
-func (s *RBACScoper) validate() error {
-	if s.Client == nil {
-		return fmt.Errorf("Client must not be nil")
-	}
-	if s.Scheme == nil {
-		return fmt.Errorf("Scheme must not be nil")
-	}
-	if s.OperatorName == "" {
-		return fmt.Errorf("OperatorName must not be empty")
-	}
-	if s.OperatorSAName == "" {
-		return fmt.Errorf("OperatorSAName must not be empty")
-	}
-	if s.OperatorSANamespace == "" {
-		return fmt.Errorf("OperatorSANamespace must not be empty")
-	}
-	if len(s.Rules) == 0 {
-		return fmt.Errorf("Rules must not be empty")
-	}
-	return nil
 }
 
 // EnsureAccess creates or updates a Role and RoleBinding in the owner's
 // namespace so that the operator ServiceAccount has the configured access there.
 func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
-	if err := s.validate(); err != nil {
-		return fmt.Errorf("invalid RBACScoper configuration: %w", err)
-	}
-
 	log := ctrl.LoggerFrom(ctx)
 	ns := owner.GetNamespace()
 
@@ -100,11 +130,14 @@ func (s *RBACScoper) ensureRole(ctx context.Context, owner client.Object, ns str
 			Namespace: ns,
 		},
 	}
-	result, err := controllerutil.CreateOrUpdate(ctx, s.Client, role, func() error {
+	result, err := controllerutil.CreateOrUpdate(ctx, s.client, role, func() error {
 		role.Labels = s.labels()
-		role.Rules = s.Rules
+		role.Rules = make([]rbacv1.PolicyRule, len(s.rules))
+		for i := range s.rules {
+			role.Rules[i] = *s.rules[i].DeepCopy()
+		}
 		// Append this CR as an owner (does not overwrite existing owners)
-		return controllerutil.SetOwnerReference(owner, role, s.Scheme)
+		return controllerutil.SetOwnerReference(owner, role, s.scheme)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to %s Role %s/%s: %w", result, ns, s.roleName(), err)
@@ -125,33 +158,34 @@ func (s *RBACScoper) ensureRoleBinding(ctx context.Context, owner client.Object,
 		rb.Labels = s.labels()
 		rb.Subjects = []rbacv1.Subject{{
 			Kind:      "ServiceAccount",
-			Name:      s.OperatorSAName,
-			Namespace: s.OperatorSANamespace,
+			Name:      s.operatorSAName,
+			Namespace: s.operatorSANamespace,
 		}}
 		rb.RoleRef = rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
 			Name:     s.roleName(),
 		}
-		return controllerutil.SetOwnerReference(owner, rb, s.Scheme)
+		return controllerutil.SetOwnerReference(owner, rb, s.scheme)
 	}
-	result, err := controllerutil.CreateOrUpdate(ctx, s.Client, rb, mutateFn)
+	result, err := controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
 	if err != nil {
 		// Handle RoleRef immutability: if someone changed RoleRef externally,
 		// delete and recreate the RoleBinding.
 		if apierrors.IsInvalid(err) {
 			log.Info("RoleBinding has drifted RoleRef, recreating", "namespace", ns)
-			if delErr := s.Client.Delete(ctx, rb); delErr != nil && !apierrors.IsNotFound(delErr) {
+			if delErr := s.client.Delete(ctx, rb); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return fmt.Errorf("deleting stale RoleBinding %s/%s: %w", ns, s.roleBindingName(), delErr)
 			}
-			// Reset for recreation
+			// Reset rb for recreation; mutateFn captures rb by pointer
+			// so it will populate the new object correctly.
 			rb = &rbacv1.RoleBinding{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      s.roleBindingName(),
 					Namespace: ns,
 				},
 			}
-			result, err = controllerutil.CreateOrUpdate(ctx, s.Client, rb, mutateFn)
+			result, err = controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
 			if err != nil {
 				return fmt.Errorf("failed to recreate RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
 			}
@@ -168,11 +202,6 @@ func (s *RBACScoper) ensureRoleBinding(ctx context.Context, owner client.Object,
 // Role/RoleBinding is deleted. This ensures that when multiple CRs share a
 // namespace, cleanup of one CR does not break the others.
 func (s *RBACScoper) CleanupAccess(ctx context.Context, owner client.Object) error {
-	if err := s.validate(); err != nil {
-		return fmt.Errorf("invalid RBACScoper configuration: %w", err)
-	}
-
-	log := ctrl.LoggerFrom(ctx)
 	ns := owner.GetNamespace()
 
 	if ns == "" {
@@ -180,52 +209,48 @@ func (s *RBACScoper) CleanupAccess(ctx context.Context, owner client.Object) err
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
-	// Remove this CR's OwnerReference from the Role.
-	// Only delete if no OwnerReferences remain.
-	role := &rbacv1.Role{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: s.roleName(), Namespace: ns}, role); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("getting Role %s/%s: %w", ns, s.roleName(), err)
+	if err := s.cleanupOwnedResource(ctx, &rbacv1.Role{},
+		types.NamespacedName{Name: s.roleName(), Namespace: ns},
+		owner, "Role"); err != nil {
+		return err
+	}
+	return s.cleanupOwnedResource(ctx, &rbacv1.RoleBinding{},
+		types.NamespacedName{Name: s.roleBindingName(), Namespace: ns},
+		owner, "RoleBinding")
+}
+
+// cleanupOwnedResource removes the owner's OwnerReference from the given
+// resource. If no OwnerReferences remain after removal, the resource is
+// deleted entirely.
+func (s *RBACScoper) cleanupOwnedResource(
+	ctx context.Context,
+	obj client.Object,
+	key types.NamespacedName,
+	owner client.Object,
+	kind string,
+) error {
+	log := ctrl.LoggerFrom(ctx)
+	if err := s.client.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
 		}
-		// Already gone, nothing to do
-	} else {
-		s.removeOwnerRef(role, owner)
-		if len(role.OwnerReferences) == 0 {
-			// No more owners -- delete the Role
-			if err := s.Client.Delete(ctx, role); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("deleting Role %s/%s: %w", ns, s.roleName(), err)
-			}
-			log.Info("deleted scoped Role (no owners remain)", "namespace", ns)
-		} else {
-			// Other CRs still need this Role -- just update to remove our OwnerRef
-			if err := s.Client.Update(ctx, role); err != nil {
-				return fmt.Errorf("updating Role %s/%s to remove owner: %w", ns, s.roleName(), err)
-			}
-			log.Info("removed OwnerReference from Role (other owners remain)", "namespace", ns, "remainingOwners", len(role.OwnerReferences))
-		}
+		return fmt.Errorf("getting %s %s: %w", kind, key, err)
 	}
 
-	// Same logic for RoleBinding
-	rb := &rbacv1.RoleBinding{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: s.roleBindingName(), Namespace: ns}, rb); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("getting RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
+	s.removeOwnerRef(obj, owner)
+	if len(obj.GetOwnerReferences()) == 0 {
+		if err := s.client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("deleting %s %s: %w", kind, key, err)
 		}
-	} else {
-		s.removeOwnerRef(rb, owner)
-		if len(rb.OwnerReferences) == 0 {
-			if err := s.Client.Delete(ctx, rb); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("deleting RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
-			}
-			log.Info("deleted scoped RoleBinding (no owners remain)", "namespace", ns)
-		} else {
-			if err := s.Client.Update(ctx, rb); err != nil {
-				return fmt.Errorf("updating RoleBinding %s/%s to remove owner: %w", ns, s.roleBindingName(), err)
-			}
-			log.Info("removed OwnerReference from RoleBinding (other owners remain)", "namespace", ns, "remainingOwners", len(rb.OwnerReferences))
-		}
+		log.Info("deleted scoped "+kind+" (no owners remain)", "namespace", key.Namespace)
+		return nil
 	}
 
+	if err := s.client.Update(ctx, obj); err != nil {
+		return fmt.Errorf("updating %s %s to remove owner: %w", kind, key, err)
+	}
+	log.Info("removed OwnerReference from "+kind+" (other owners remain)",
+		"namespace", key.Namespace, "remainingOwners", len(obj.GetOwnerReferences()))
 	return nil
 }
 

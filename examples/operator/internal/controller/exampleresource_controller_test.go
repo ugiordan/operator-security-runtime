@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -27,6 +28,32 @@ func testScheme() *runtime.Scheme {
 	utilruntime.Must(rbacv1.AddToScheme(s))
 	utilruntime.Must(corev1.AddToScheme(s))
 	return s
+}
+
+func newTestRBACScoper(t *testing.T, cl client.Client, s *runtime.Scheme) *rbacscope.RBACScoper {
+	t.Helper()
+	allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules returned error: %v", err)
+	}
+	scoper, err := rbacscope.NewRBACScoper(
+		cl,
+		s,
+		rbacscope.OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-sa",
+			Namespace:      "operator-ns",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper returned error: %v", err)
+	}
+	return scoper
 }
 
 func TestExampleResourceReconciler_CreatesRoleAndRoleBinding(t *testing.T) {
@@ -53,18 +80,7 @@ func TestExampleResourceReconciler_CreatesRoleAndRoleBinding(t *testing.T) {
 		WithStatusSubresource(cr).
 		Build()
 
-	scoper := &rbacscope.RBACScoper{
-		Client:              fakeClient,
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-sa",
-		OperatorSANamespace: "operator-ns",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
-	}
+	scoper := newTestRBACScoper(t, fakeClient, s)
 
 	reconciler := &ExampleResourceReconciler{
 		Client:     fakeClient,
@@ -194,18 +210,7 @@ func TestExampleResourceReconciler_Deletion(t *testing.T) {
 		WithStatusSubresource(cr).
 		Build()
 
-	scoper := &rbacscope.RBACScoper{
-		Client:              fakeClient,
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-sa",
-		OperatorSANamespace: "operator-ns",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
-	}
+	scoper := newTestRBACScoper(t, fakeClient, s)
 
 	reconciler := &ExampleResourceReconciler{
 		Client:     fakeClient,
@@ -270,18 +275,7 @@ func TestExampleResourceReconciler_NotFound(t *testing.T) {
 		WithScheme(s).
 		Build()
 
-	scoper := &rbacscope.RBACScoper{
-		Client:              fakeClient,
-		Scheme:              s,
-		OperatorName:        "test-operator",
-		OperatorSAName:      "test-sa",
-		OperatorSANamespace: "operator-ns",
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
-	}
+	scoper := newTestRBACScoper(t, fakeClient, s)
 
 	reconciler := &ExampleResourceReconciler{
 		Client:     fakeClient,

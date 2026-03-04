@@ -137,17 +137,29 @@ func main() {
 	operatorSA := getEnvOrDefault("OPERATOR_SA_NAME", "k8s-serviceaccount-hijacking-protection-controller-manager")
 	operatorName := getEnvOrDefault("OPERATOR_NAME", "example-operator")
 
-	rbacScoper := &rbacscope.RBACScoper{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		OperatorName:        operatorName,
-		OperatorSAName:      operatorSA,
-		OperatorSANamespace: operatorNS,
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"secrets"},
-			Verbs:     []string{"get", "list", "watch"},
-		}},
+	allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"secrets"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		setupLog.Error(err, "invalid allowed rules")
+		os.Exit(1)
+	}
+
+	rbacScoper, err := rbacscope.NewRBACScoper(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		rbacscope.OperatorIdentity{
+			Name:           operatorName,
+			ServiceAccount: operatorSA,
+			Namespace:      operatorNS,
+		},
+		allowed,
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create RBAC scoper")
+		os.Exit(1)
 	}
 
 	if err = (&controller.ExampleResourceReconciler{
