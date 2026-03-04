@@ -123,6 +123,67 @@ func TestNewClusterRBACScoper_Validation(t *testing.T) {
 	}
 }
 
+func TestNewClusterRBACScoper_DNS1123Validation(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	validRules, _ := NewAllowedRules(rbacv1.PolicyRule{Verbs: []string{"get"}})
+
+	tests := []struct {
+		name     string
+		identity OperatorIdentity
+		wantErr  bool
+		errMsg   string
+	}{
+		{
+			name: "uppercase Name rejected",
+			identity: OperatorIdentity{
+				Name:           "My-Operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "valid Name accepted",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Name with underscores rejected",
+			identity: OperatorIdentity{
+				Name:           "my_operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewClusterRBACScoper(cl, tt.identity, validRules)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error containing %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestEnsureClusterAccess_CreatesClusterRoleAndBinding(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()

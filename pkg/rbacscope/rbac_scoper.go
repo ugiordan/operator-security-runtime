@@ -335,35 +335,59 @@ func (s *RBACScoper) CleanupAllAccess(ctx context.Context, owner client.Object) 
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
-	// Note: This lists all managed Roles/RoleBindings cluster-wide.
-	// For operators managing many namespaces, consider adding pagination
-	// via client.Limit/client.Continue.
-
-	// Cleanup all managed Roles
+	// Cleanup all managed Roles (paginated to limit API server load)
 	roleList := &rbacv1.RoleList{}
-	if err := s.client.List(ctx, roleList, client.MatchingLabels(s.labels())); err != nil {
-		return fmt.Errorf("listing managed Roles: %w", err)
+	listOpts := []client.ListOption{
+		client.MatchingLabels(s.labels()),
+		client.Limit(cleanupListPageSize),
 	}
-	for i := range roleList.Items {
-		if roleList.Items[i].Name != s.roleName() {
-			continue
+	for {
+		if err := s.client.List(ctx, roleList, listOpts...); err != nil {
+			return fmt.Errorf("listing managed Roles: %w", err)
 		}
-		if err := s.cleanupManagedResource(ctx, &roleList.Items[i], owner, &s.ownerTracker, "Role"); err != nil {
-			return err
+		for i := range roleList.Items {
+			if roleList.Items[i].Name != s.roleName() {
+				continue
+			}
+			if err := s.cleanupManagedResource(ctx, &roleList.Items[i], owner, &s.ownerTracker, "Role"); err != nil {
+				return err
+			}
+		}
+		if roleList.Continue == "" {
+			break
+		}
+		listOpts = []client.ListOption{
+			client.MatchingLabels(s.labels()),
+			client.Limit(cleanupListPageSize),
+			client.Continue(roleList.Continue),
 		}
 	}
 
-	// Cleanup all managed RoleBindings
+	// Cleanup all managed RoleBindings (paginated to limit API server load)
 	rbList := &rbacv1.RoleBindingList{}
-	if err := s.client.List(ctx, rbList, client.MatchingLabels(s.labels())); err != nil {
-		return fmt.Errorf("listing managed RoleBindings: %w", err)
+	listOpts = []client.ListOption{
+		client.MatchingLabels(s.labels()),
+		client.Limit(cleanupListPageSize),
 	}
-	for i := range rbList.Items {
-		if rbList.Items[i].Name != s.roleBindingName() {
-			continue
+	for {
+		if err := s.client.List(ctx, rbList, listOpts...); err != nil {
+			return fmt.Errorf("listing managed RoleBindings: %w", err)
 		}
-		if err := s.cleanupManagedResource(ctx, &rbList.Items[i], owner, &s.ownerTracker, "RoleBinding"); err != nil {
-			return err
+		for i := range rbList.Items {
+			if rbList.Items[i].Name != s.roleBindingName() {
+				continue
+			}
+			if err := s.cleanupManagedResource(ctx, &rbList.Items[i], owner, &s.ownerTracker, "RoleBinding"); err != nil {
+				return err
+			}
+		}
+		if rbList.Continue == "" {
+			break
+		}
+		listOpts = []client.ListOption{
+			client.MatchingLabels(s.labels()),
+			client.Limit(cleanupListPageSize),
+			client.Continue(rbList.Continue),
 		}
 	}
 

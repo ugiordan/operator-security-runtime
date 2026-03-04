@@ -724,6 +724,168 @@ func TestNewRBACScoper_ValidationErrors(t *testing.T) {
 	}
 }
 
+func TestNewRBACScoper_DNS1123Validation(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	validRules, _ := NewAllowedRules(rbacv1.PolicyRule{Verbs: []string{"get"}})
+
+	longName := strings.Repeat("a", 254)
+
+	tests := []struct {
+		name     string
+		identity OperatorIdentity
+		wantErr  bool
+		errMsg   string
+	}{
+		{
+			name: "uppercase Name",
+			identity: OperatorIdentity{
+				Name:           "My-Operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "Name with underscores",
+			identity: OperatorIdentity{
+				Name:           "my_operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "Name with spaces",
+			identity: OperatorIdentity{
+				Name:           "my operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "Name too long",
+			identity: OperatorIdentity{
+				Name:           longName,
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be no more than 253 characters",
+		},
+		{
+			name: "Name starting with hyphen",
+			identity: OperatorIdentity{
+				Name:           "-my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Name must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "valid Name",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid Name with dots",
+			identity: OperatorIdentity{
+				Name:           "my.operator.v1",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: false,
+		},
+		{
+			name: "uppercase ServiceAccount",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "My-SA",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.ServiceAccount must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "ServiceAccount with underscores",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "my_sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.ServiceAccount must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "ServiceAccount starting with hyphen",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "-my-sa",
+				Namespace:      "test-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.ServiceAccount must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "uppercase Namespace",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "My-Namespace",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Namespace must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "Namespace with underscores",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "my_namespace",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Namespace must be a valid DNS-1123 subdomain",
+		},
+		{
+			name: "Namespace starting with hyphen",
+			identity: OperatorIdentity{
+				Name:           "my-operator",
+				ServiceAccount: "test-sa",
+				Namespace:      "-my-ns",
+			},
+			wantErr: true,
+			errMsg:  "OperatorIdentity.Namespace must be a valid DNS-1123 subdomain",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRBACScoper(cl, s, tt.identity, validRules)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error containing %q, got %q", tt.errMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestNewAllowedRules_EmptyReturnsError(t *testing.T) {
 	_, err := NewAllowedRules()
 	if err == nil {
@@ -1526,4 +1688,236 @@ func TestEnsureAccess_AllowAllRulesProducesEmptyRole(t *testing.T) {
 	if len(role.Rules) != 0 {
 		t.Errorf("expected 0 rules with AllowAllRules (documents current behavior), got %d", len(role.Rules))
 	}
+}
+
+func TestCleanupAllAccess_Pagination(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "paginated-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("paginated-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// Create access in the owner's namespace (uses OwnerReferences)
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "owner-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace (owner-ns) failed: %v", err)
+	}
+
+	// Create access in multiple remote namespaces (uses annotations)
+	remoteNamespaces := []string{"remote-ns-a", "remote-ns-b", "remote-ns-c"}
+	for _, ns := range remoteNamespaces {
+		if err := scoper.EnsureAccessInNamespace(ctx, cr, ns); err != nil {
+			t.Fatalf("EnsureAccessInNamespace (%s) failed: %v", ns, err)
+		}
+	}
+
+	allNamespaces := append([]string{"owner-ns"}, remoteNamespaces...)
+
+	// Verify all Roles and RoleBindings exist before cleanup
+	for _, ns := range allNamespaces {
+		role := &rbacv1.Role{}
+		if err := scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access", Namespace: ns,
+		}, role); err != nil {
+			t.Fatalf("expected Role to exist in %s before cleanup: %v", ns, err)
+		}
+		rb := &rbacv1.RoleBinding{}
+		if err := scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access-binding", Namespace: ns,
+		}, rb); err != nil {
+			t.Fatalf("expected RoleBinding to exist in %s before cleanup: %v", ns, err)
+		}
+	}
+
+	// CleanupAllAccess should clean up all resources across all namespaces,
+	// exercising the paginated listing code path (the fake client returns
+	// all results in one page, but the pagination loop still executes).
+	if err := scoper.CleanupAllAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupAllAccess returned error: %v", err)
+	}
+
+	// Verify all Roles and RoleBindings are deleted
+	for _, ns := range allNamespaces {
+		role := &rbacv1.Role{}
+		err := scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access", Namespace: ns,
+		}, role)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected Role in %s to be deleted, got err=%v", ns, err)
+		}
+
+		rb := &rbacv1.RoleBinding{}
+		err = scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access-binding", Namespace: ns,
+		}, rb)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected RoleBinding in %s to be deleted, got err=%v", ns, err)
+		}
+	}
+}
+
+func TestAnnotationCorruptionResilience(t *testing.T) {
+	tracker := &annotationOwnerTracker{annotationKey: ownerAnnotationKey}
+
+	// Helper to create an object with a pre-set annotation value.
+	objWithAnnotation := func(value string) *testResource {
+		return &testResource{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "corrupted-obj",
+				Namespace: "test-ns",
+				Annotations: map[string]string{
+					ownerAnnotationKey: value,
+				},
+			},
+		}
+	}
+
+	// Helper to create an owner object for use in addOwner/removeOwner.
+	makeOwner := func(ns, name, uid string) *testResource {
+		return &testResource{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+				UID:       types.UID(uid),
+			},
+		}
+	}
+
+	t.Run("trailing commas", func(t *testing.T) {
+		obj := objWithAnnotation("ns/name/uid,")
+
+		if !tracker.hasOwners(obj) {
+			t.Error("hasOwners should return true when a valid entry exists before trailing comma")
+		}
+
+		// removeOwner with a different owner should preserve the valid entry
+		differentOwner := makeOwner("other-ns", "other-name", "other-uid")
+		tracker.removeOwner(obj, differentOwner)
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		if annotation != "ns/name/uid" {
+			t.Errorf("expected annotation to be %q after removing non-existent owner, got %q", "ns/name/uid", annotation)
+		}
+	})
+
+	t.Run("leading commas", func(t *testing.T) {
+		obj := objWithAnnotation(",ns/name/uid")
+
+		if !tracker.hasOwners(obj) {
+			t.Error("hasOwners should return true when a valid entry exists after leading comma")
+		}
+
+		// removeOwner with a different owner should preserve the valid entry
+		differentOwner := makeOwner("other-ns", "other-name", "other-uid")
+		tracker.removeOwner(obj, differentOwner)
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		if annotation != "ns/name/uid" {
+			t.Errorf("expected annotation to be %q after removing non-existent owner, got %q", "ns/name/uid", annotation)
+		}
+	})
+
+	t.Run("multiple commas", func(t *testing.T) {
+		obj := objWithAnnotation("ns/name/uid,,,ns2/name2/uid2")
+
+		if !tracker.hasOwners(obj) {
+			t.Error("hasOwners should return true when valid entries exist between multiple commas")
+		}
+
+		// removeOwner with a non-matching owner should preserve both valid entries
+		differentOwner := makeOwner("other-ns", "other-name", "other-uid")
+		tracker.removeOwner(obj, differentOwner)
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		if !strings.Contains(annotation, "ns/name/uid") {
+			t.Errorf("expected annotation to contain %q, got %q", "ns/name/uid", annotation)
+		}
+		if !strings.Contains(annotation, "ns2/name2/uid2") {
+			t.Errorf("expected annotation to contain %q, got %q", "ns2/name2/uid2", annotation)
+		}
+	})
+
+	t.Run("only commas", func(t *testing.T) {
+		obj := objWithAnnotation(",,,")
+
+		if tracker.hasOwners(obj) {
+			t.Error("hasOwners should return false when annotation contains only commas")
+		}
+	})
+
+	t.Run("whitespace entries", func(t *testing.T) {
+		obj := objWithAnnotation("  ,  ,  ")
+
+		if tracker.hasOwners(obj) {
+			t.Error("hasOwners should return false when annotation contains only whitespace entries")
+		}
+	})
+
+	t.Run("entry without UID", func(t *testing.T) {
+		obj := objWithAnnotation("ns/name")
+
+		// "ns/name" is a non-empty string entry, even if malformed
+		if !tracker.hasOwners(obj) {
+			t.Error("hasOwners should return true for non-empty malformed entry")
+		}
+
+		// removeOwner with "ns/name/uid" should NOT remove "ns/name" (different key)
+		owner := makeOwner("ns", "name", "uid")
+		tracker.removeOwner(obj, owner)
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		if annotation != "ns/name" {
+			t.Errorf("expected malformed entry %q to be preserved (key mismatch), got %q", "ns/name", annotation)
+		}
+	})
+
+	t.Run("addOwner to corrupted annotation", func(t *testing.T) {
+		obj := objWithAnnotation("corrupted,,,data")
+
+		newOwner := makeOwner("new-ns", "new-name", "new-uid")
+		if err := tracker.addOwner(obj, newOwner); err != nil {
+			t.Fatalf("addOwner should succeed on corrupted annotation, got error: %v", err)
+		}
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		// The new owner should be appended to the existing (corrupted) value
+		if !strings.Contains(annotation, "corrupted") {
+			t.Errorf("expected corrupted entries to be preserved, got %q", annotation)
+		}
+		if !strings.Contains(annotation, "data") {
+			t.Errorf("expected corrupted entries to be preserved, got %q", annotation)
+		}
+		if !strings.Contains(annotation, "new-ns/new-name/new-uid") {
+			t.Errorf("expected new owner to be present, got %q", annotation)
+		}
+	})
+
+	t.Run("removeOwner from corrupted annotation preserves others", func(t *testing.T) {
+		// Mix of valid and corrupted entries
+		obj := objWithAnnotation("corrupted-entry,ns/valid-owner/valid-uid,,,also-corrupted")
+
+		// Remove the valid owner
+		validOwner := makeOwner("ns", "valid-owner", "valid-uid")
+		tracker.removeOwner(obj, validOwner)
+
+		annotation := obj.GetAnnotations()[ownerAnnotationKey]
+		// Corrupted entries should remain (they don't match the owner key)
+		if !strings.Contains(annotation, "corrupted-entry") {
+			t.Errorf("expected corrupted entry to be preserved, got %q", annotation)
+		}
+		if !strings.Contains(annotation, "also-corrupted") {
+			t.Errorf("expected corrupted entry to be preserved, got %q", annotation)
+		}
+		// The valid owner should be removed
+		if strings.Contains(annotation, "ns/valid-owner/valid-uid") {
+			t.Errorf("expected valid owner to be removed, got %q", annotation)
+		}
+	})
 }

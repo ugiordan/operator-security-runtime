@@ -2,11 +2,32 @@ package rbacscope
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// dns1123SubdomainRegexp matches valid DNS-1123 subdomain names:
+// lowercase alphanumeric, hyphens, and dots; must start and end with alphanumeric.
+var dns1123SubdomainRegexp = regexp.MustCompile(`^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$`)
+
+// validateDNS1123Subdomain checks that value is a valid DNS-1123 subdomain
+// (as required by Kubernetes resource names). Returns a descriptive error
+// if the value is empty, too long, or contains invalid characters.
+func validateDNS1123Subdomain(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	if len(value) > 253 {
+		return fmt.Errorf("%s must be no more than 253 characters: got %d", field, len(value))
+	}
+	if !dns1123SubdomainRegexp.MatchString(value) {
+		return fmt.Errorf("%s must be a valid DNS-1123 subdomain: got %q", field, value)
+	}
+	return nil
+}
 
 const (
 	// ownerAnnotationKey is the annotation used to track cross-namespace owners.
@@ -16,6 +37,11 @@ const (
 	// maxAnnotationOwners limits the number of owner entries stored in the
 	// annotation to prevent unbounded growth.
 	maxAnnotationOwners = 100
+
+	// cleanupListPageSize is the page size used when listing managed resources
+	// during CleanupAllAccess. Limits API server load for operators managing
+	// many namespaces.
+	cleanupListPageSize = 100
 )
 
 // annotationOwnerTracker manages annotation-based ownership for resources
@@ -141,6 +167,15 @@ func validateCoreInputs(
 	}
 	if identity.Namespace == "" {
 		return scopeConfig{}, nil, fmt.Errorf("OperatorIdentity.Namespace must not be empty")
+	}
+	if err := validateDNS1123Subdomain("OperatorIdentity.Name", identity.Name); err != nil {
+		return scopeConfig{}, nil, err
+	}
+	if err := validateDNS1123Subdomain("OperatorIdentity.ServiceAccount", identity.ServiceAccount); err != nil {
+		return scopeConfig{}, nil, err
+	}
+	if err := validateDNS1123Subdomain("OperatorIdentity.Namespace", identity.Namespace); err != nil {
+		return scopeConfig{}, nil, err
 	}
 	if !allowed.allowAll && len(allowed.rules) == 0 {
 		return scopeConfig{}, nil, fmt.Errorf("AllowedRules must not be empty")
