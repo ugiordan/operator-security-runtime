@@ -1,0 +1,619 @@
+package rbacscope
+
+import (
+	"context"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+)
+
+func newTestClusterScoper(t *testing.T, cl client.Client) *ClusterRBACScoper {
+	t.Helper()
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"nodes"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules failed: %v", err)
+	}
+	scoper, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewClusterRBACScoper failed: %v", err)
+	}
+	return scoper
+}
+
+func TestNewClusterRBACScoper_Validation(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+
+	validRules, _ := NewAllowedRules(rbacv1.PolicyRule{Verbs: []string{"get"}})
+
+	tests := []struct {
+		name     string
+		cl       client.Client
+		identity OperatorIdentity
+		allowed  AllowedRules
+		errMsg   string
+	}{
+		{
+			name: "nil client",
+			cl:   nil,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			allowed: validRules,
+			errMsg:  "client must not be nil",
+		},
+		{
+			name: "empty Name",
+			cl:   cl,
+			identity: OperatorIdentity{
+				Name:           "",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.Name must not be empty",
+		},
+		{
+			name: "empty ServiceAccount",
+			cl:   cl,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "",
+				Namespace:      "test-ns",
+			},
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.ServiceAccount must not be empty",
+		},
+		{
+			name: "empty Namespace",
+			cl:   cl,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "",
+			},
+			allowed: validRules,
+			errMsg:  "OperatorIdentity.Namespace must not be empty",
+		},
+		{
+			name: "empty AllowedRules",
+			cl:   cl,
+			identity: OperatorIdentity{
+				Name:           "test",
+				ServiceAccount: "test-sa",
+				Namespace:      "test-ns",
+			},
+			allowed: AllowedRules{}, // zero-value: no rules and allowAll=false
+			errMsg:  "AllowedRules must not be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewClusterRBACScoper(tt.cl, tt.identity, tt.allowed)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("expected error containing %q, got %q", tt.errMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestEnsureClusterAccess_CreatesClusterRoleAndBinding(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	cr := newTestCR()
+	ctx := context.Background()
+
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	}
+
+	// Verify ClusterRole was created
+	clusterRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole); err != nil {
+		t.Fatalf("expected ClusterRole to exist, got error: %v", err)
+	}
+
+	// Verify ClusterRole rules
+	if len(clusterRole.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(clusterRole.Rules))
+	}
+	policyRule := clusterRole.Rules[0]
+	if len(policyRule.APIGroups) != 1 || policyRule.APIGroups[0] != "" {
+		t.Errorf("expected APIGroups [\"\"], got %v", policyRule.APIGroups)
+	}
+	if len(policyRule.Resources) != 1 || policyRule.Resources[0] != "nodes" {
+		t.Errorf("expected Resources [\"nodes\"], got %v", policyRule.Resources)
+	}
+	expectedVerbs := []string{"get", "list", "watch"}
+	if len(policyRule.Verbs) != len(expectedVerbs) {
+		t.Errorf("expected %d verbs, got %d", len(expectedVerbs), len(policyRule.Verbs))
+	}
+	for i, v := range expectedVerbs {
+		if i < len(policyRule.Verbs) && policyRule.Verbs[i] != v {
+			t.Errorf("expected verb[%d] = %q, got %q", i, v, policyRule.Verbs[i])
+		}
+	}
+
+	// Verify ClusterRole labels
+	if clusterRole.Labels["app.kubernetes.io/managed-by"] != "test-operator" {
+		t.Errorf("expected managed-by label = test-operator, got %q", clusterRole.Labels["app.kubernetes.io/managed-by"])
+	}
+	if clusterRole.Labels["app.kubernetes.io/component"] != "cluster-rbac-scoper" {
+		t.Errorf("expected component label = cluster-rbac-scoper, got %q", clusterRole.Labels["app.kubernetes.io/component"])
+	}
+
+	// Verify annotation-based ownership (NOT OwnerReferences)
+	if len(clusterRole.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences on ClusterRole, got %d", len(clusterRole.OwnerReferences))
+	}
+	annotations := clusterRole.GetAnnotations()
+	ownerAnnotation := annotations[ownerAnnotationKey]
+	expectedKey := "target-ns/test-cr/test-uid-12345"
+	if ownerAnnotation != expectedKey {
+		t.Errorf("expected owner annotation %q, got %q", expectedKey, ownerAnnotation)
+	}
+
+	// Verify ClusterRoleBinding was created
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb); err != nil {
+		t.Fatalf("expected ClusterRoleBinding to exist, got error: %v", err)
+	}
+
+	// Verify ClusterRoleBinding RoleRef
+	if crb.RoleRef.APIGroup != "rbac.authorization.k8s.io" {
+		t.Errorf("expected RoleRef APIGroup = rbac.authorization.k8s.io, got %q", crb.RoleRef.APIGroup)
+	}
+	if crb.RoleRef.Kind != "ClusterRole" {
+		t.Errorf("expected RoleRef Kind = ClusterRole, got %q", crb.RoleRef.Kind)
+	}
+	if crb.RoleRef.Name != "test-operator-cluster-scoped-access" {
+		t.Errorf("expected RoleRef Name = test-operator-cluster-scoped-access, got %q", crb.RoleRef.Name)
+	}
+
+	// Verify ClusterRoleBinding Subjects
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("expected 1 Subject, got %d", len(crb.Subjects))
+	}
+	subj := crb.Subjects[0]
+	if subj.Kind != "ServiceAccount" {
+		t.Errorf("expected Subject Kind = ServiceAccount, got %q", subj.Kind)
+	}
+	if subj.Name != "test-operator-sa" {
+		t.Errorf("expected Subject Name = test-operator-sa, got %q", subj.Name)
+	}
+	if subj.Namespace != "operator-system" {
+		t.Errorf("expected Subject Namespace = operator-system, got %q", subj.Namespace)
+	}
+
+	// Verify ClusterRoleBinding labels
+	if crb.Labels["app.kubernetes.io/managed-by"] != "test-operator" {
+		t.Errorf("expected managed-by label = test-operator, got %q", crb.Labels["app.kubernetes.io/managed-by"])
+	}
+	if crb.Labels["app.kubernetes.io/component"] != "cluster-rbac-scoper" {
+		t.Errorf("expected component label = cluster-rbac-scoper, got %q", crb.Labels["app.kubernetes.io/component"])
+	}
+
+	// Verify annotation-based ownership on ClusterRoleBinding
+	if len(crb.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences on ClusterRoleBinding, got %d", len(crb.OwnerReferences))
+	}
+	crbAnnotation := crb.GetAnnotations()[ownerAnnotationKey]
+	if crbAnnotation != expectedKey {
+		t.Errorf("expected ClusterRoleBinding owner annotation %q, got %q", expectedKey, crbAnnotation)
+	}
+}
+
+func TestEnsureClusterAccess_Idempotent(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	cr := newTestCR()
+	ctx := context.Background()
+
+	// First call
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("first EnsureClusterAccess returned error: %v", err)
+	}
+
+	// Second call should not error
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("second EnsureClusterAccess returned error: %v", err)
+	}
+
+	// Verify ClusterRole still exists with single annotation entry
+	clusterRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole); err != nil {
+		t.Fatalf("expected ClusterRole to exist after idempotent call, got error: %v", err)
+	}
+
+	ownerAnnotation := clusterRole.GetAnnotations()[ownerAnnotationKey]
+	expectedKey := "target-ns/test-cr/test-uid-12345"
+	if ownerAnnotation != expectedKey {
+		t.Errorf("expected single owner annotation %q, got %q (possible duplication)", expectedKey, ownerAnnotation)
+	}
+
+	// Verify ClusterRoleBinding still exists
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb); err != nil {
+		t.Fatalf("expected ClusterRoleBinding to exist after idempotent call, got error: %v", err)
+	}
+
+	crbAnnotation := crb.GetAnnotations()[ownerAnnotationKey]
+	if crbAnnotation != expectedKey {
+		t.Errorf("expected single owner annotation on ClusterRoleBinding %q, got %q", expectedKey, crbAnnotation)
+	}
+}
+
+func TestEnsureClusterAccess_MultiOwnerAnnotation(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	ctx := context.Background()
+
+	// Two owners from different namespaces share the ClusterRole
+	cr1 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-alpha",
+			Namespace: "ns-alpha",
+			UID:       types.UID("uid-alpha"),
+		},
+	}
+	cr1.SetGroupVersionKind(testGVK)
+
+	cr2 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-beta",
+			Namespace: "ns-beta",
+			UID:       types.UID("uid-beta"),
+		},
+	}
+	cr2.SetGroupVersionKind(testGVK)
+
+	// Ensure access for both
+	if err := scoper.EnsureClusterAccess(ctx, cr1); err != nil {
+		t.Fatalf("EnsureClusterAccess for cr1 failed: %v", err)
+	}
+	if err := scoper.EnsureClusterAccess(ctx, cr2); err != nil {
+		t.Fatalf("EnsureClusterAccess for cr2 failed: %v", err)
+	}
+
+	// Verify both owners are in the annotation
+	clusterRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole); err != nil {
+		t.Fatalf("expected ClusterRole to exist: %v", err)
+	}
+	annotation := clusterRole.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(annotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected annotation to contain cr1's key, got %q", annotation)
+	}
+	if !strings.Contains(annotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected annotation to contain cr2's key, got %q", annotation)
+	}
+
+	// Verify ClusterRoleBinding also has both owners
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb); err != nil {
+		t.Fatalf("expected ClusterRoleBinding to exist: %v", err)
+	}
+	crbAnnotation := crb.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(crbAnnotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected ClusterRoleBinding annotation to contain cr1's key, got %q", crbAnnotation)
+	}
+	if !strings.Contains(crbAnnotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected ClusterRoleBinding annotation to contain cr2's key, got %q", crbAnnotation)
+	}
+}
+
+func TestCleanupClusterAccess_DeletesWhenNoOwnersRemain(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	cr := newTestCR()
+	ctx := context.Background()
+
+	// First create
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	}
+
+	// Then cleanup
+	if err := scoper.CleanupClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupClusterAccess returned error: %v", err)
+	}
+
+	// Verify ClusterRole is gone
+	clusterRole := &rbacv1.ClusterRole{}
+	err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole to be deleted, got err=%v", err)
+	}
+
+	// Verify ClusterRoleBinding is gone
+	crb := &rbacv1.ClusterRoleBinding{}
+	err = cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRoleBinding to be deleted, got err=%v", err)
+	}
+}
+
+func TestCleanupClusterAccess_PreservesWhenOtherOwnersExist(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	ctx := context.Background()
+
+	cr1 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-alpha",
+			Namespace: "ns-alpha",
+			UID:       types.UID("uid-alpha"),
+		},
+	}
+	cr1.SetGroupVersionKind(testGVK)
+
+	cr2 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-beta",
+			Namespace: "ns-beta",
+			UID:       types.UID("uid-beta"),
+		},
+	}
+	cr2.SetGroupVersionKind(testGVK)
+
+	// Ensure access for both
+	if err := scoper.EnsureClusterAccess(ctx, cr1); err != nil {
+		t.Fatalf("EnsureClusterAccess for cr1 failed: %v", err)
+	}
+	if err := scoper.EnsureClusterAccess(ctx, cr2); err != nil {
+		t.Fatalf("EnsureClusterAccess for cr2 failed: %v", err)
+	}
+
+	// Cleanup cr1 only
+	if err := scoper.CleanupClusterAccess(ctx, cr1); err != nil {
+		t.Fatalf("CleanupClusterAccess for cr1 failed: %v", err)
+	}
+
+	// ClusterRole should still exist with cr2's annotation
+	clusterRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole); err != nil {
+		t.Fatal("ClusterRole was deleted when another owner (cr2) still exists")
+	}
+	remainingAnnotation := clusterRole.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(remainingAnnotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected remaining annotation to contain cr2's key, got %q", remainingAnnotation)
+	}
+	if strings.Contains(remainingAnnotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected cr1's key to be removed from annotation, got %q", remainingAnnotation)
+	}
+
+	// ClusterRoleBinding should also still exist
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb); err != nil {
+		t.Fatal("ClusterRoleBinding was deleted when another owner (cr2) still exists")
+	}
+	crbAnnotation := crb.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(crbAnnotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected remaining CRB annotation to contain cr2's key, got %q", crbAnnotation)
+	}
+
+	// Now cleanup cr2 -- everything should be deleted
+	if err := scoper.CleanupClusterAccess(ctx, cr2); err != nil {
+		t.Fatalf("CleanupClusterAccess for cr2 failed: %v", err)
+	}
+
+	err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole to be deleted after all owners cleaned up, got err=%v", err)
+	}
+
+	err = cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRoleBinding to be deleted after all owners cleaned up, got err=%v", err)
+	}
+}
+
+func TestCleanupClusterAccess_NoErrorWhenNotFound(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	cr := newTestCR()
+	ctx := context.Background()
+
+	// Cleanup without creating anything should not error
+	if err := scoper.CleanupClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupClusterAccess returned error when nothing existed: %v", err)
+	}
+}
+
+func TestEnsureClusterAccess_RejectsClusterScopedOwner(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoper(t, cl)
+	ctx := context.Background()
+
+	// Create a cluster-scoped resource (no namespace)
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-scoped-cr",
+			UID:  types.UID("cluster-uid"),
+			// No Namespace -- cluster-scoped
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	// EnsureClusterAccess should reject cluster-scoped owners
+	err := scoper.EnsureClusterAccess(ctx, clusterCR)
+	if err == nil {
+		t.Fatal("expected error for cluster-scoped owner, got nil")
+	}
+	if !strings.Contains(err.Error(), "namespace-scoped") {
+		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	}
+
+	// CleanupClusterAccess should also reject
+	err = scoper.CleanupClusterAccess(ctx, clusterCR)
+	if err == nil {
+		t.Fatal("expected error from CleanupClusterAccess for cluster-scoped owner, got nil")
+	}
+	if !strings.Contains(err.Error(), "namespace-scoped") {
+		t.Errorf("CleanupClusterAccess: expected error about namespace-scoped, got %q", err.Error())
+	}
+}
+
+func TestEnsureClusterAccess_ClusterRoleBindingDriftRecovery(t *testing.T) {
+	s := testScheme()
+
+	// Pre-create a ClusterRoleBinding with a DIFFERENT RoleRef to simulate drift.
+	driftedCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access-binding",
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "some-other-cluster-role", // wrong RoleRef
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind: "ServiceAccount",
+			Name: "old-sa",
+		}},
+	}
+
+	// Use an interceptor to return IsInvalid on the first ClusterRoleBinding Update,
+	// simulating Kubernetes rejecting a RoleRef change.
+	var updateRejected atomic.Bool
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(driftedCRB).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if crb, ok := obj.(*rbacv1.ClusterRoleBinding); ok {
+					if crb.Name == "test-operator-cluster-scoped-access-binding" && !updateRejected.Load() {
+						updateRejected.Store(true)
+						return apierrors.NewInvalid(
+							rbacv1.SchemeGroupVersion.WithKind("ClusterRoleBinding").GroupKind(),
+							crb.Name,
+							nil,
+						)
+					}
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).Build()
+
+	scoper := newTestClusterScoper(t, cl)
+	cr := newTestCR()
+	ctx := context.Background()
+
+	// EnsureClusterAccess should succeed by detecting the invalid error and recreating.
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureClusterAccess should recover from ClusterRoleBinding drift, got error: %v", err)
+	}
+
+	// Verify the ClusterRoleBinding now has the correct RoleRef.
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access-binding",
+	}, crb); err != nil {
+		t.Fatalf("expected ClusterRoleBinding to exist after drift recovery: %v", err)
+	}
+
+	if crb.RoleRef.Name != "test-operator-cluster-scoped-access" {
+		t.Errorf("expected RoleRef Name = test-operator-cluster-scoped-access, got %q", crb.RoleRef.Name)
+	}
+	if crb.Subjects[0].Name != "test-operator-sa" {
+		t.Errorf("expected Subject Name = test-operator-sa, got %q", crb.Subjects[0].Name)
+	}
+
+	// Verify the interceptor was triggered (the drift path was actually exercised).
+	if !updateRejected.Load() {
+		t.Error("expected the interceptor to reject at least one Update, but it was never triggered")
+	}
+}
+
+func TestEnsureClusterAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+
+	allowed := AllowAllRules()
+	scoper, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+	)
+	if err != nil {
+		t.Fatalf("NewClusterRBACScoper failed: %v", err)
+	}
+
+	cr := newTestCR()
+	ctx := context.Background()
+
+	if err := scoper.EnsureClusterAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureClusterAccess returned error: %v", err)
+	}
+
+	// Verify ClusterRole has zero rules when AllowAllRules is used
+	clusterRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name: "test-operator-cluster-scoped-access",
+	}, clusterRole); err != nil {
+		t.Fatalf("expected ClusterRole to exist, got error: %v", err)
+	}
+
+	if len(clusterRole.Rules) != 0 {
+		t.Errorf("expected 0 rules with AllowAllRules, got %d", len(clusterRole.Rules))
+	}
+}

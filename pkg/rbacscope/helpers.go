@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -113,7 +114,53 @@ func (t *annotationOwnerTracker) hasOwners(obj client.Object) bool {
 	}
 
 	existing := annotations[t.annotationKey]
-	return existing != ""
+	for _, entry := range strings.Split(existing, ",") {
+		if strings.TrimSpace(entry) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCoreInputs validates the common inputs shared by NewRBACScoper and
+// NewClusterRBACScoper. Returns the resolved scopeConfig and deep-copied rules.
+func validateCoreInputs(
+	cl client.Client,
+	identity OperatorIdentity,
+	allowed AllowedRules,
+	opts []Option,
+) (scopeConfig, []rbacv1.PolicyRule, error) {
+	if cl == nil {
+		return scopeConfig{}, nil, fmt.Errorf("client must not be nil")
+	}
+	if identity.Name == "" {
+		return scopeConfig{}, nil, fmt.Errorf("OperatorIdentity.Name must not be empty")
+	}
+	if identity.ServiceAccount == "" {
+		return scopeConfig{}, nil, fmt.Errorf("OperatorIdentity.ServiceAccount must not be empty")
+	}
+	if identity.Namespace == "" {
+		return scopeConfig{}, nil, fmt.Errorf("OperatorIdentity.Namespace must not be empty")
+	}
+	if !allowed.allowAll && len(allowed.rules) == 0 {
+		return scopeConfig{}, nil, fmt.Errorf("AllowedRules must not be empty")
+	}
+
+	cfg := defaultScopeConfig()
+	for _, opt := range opts {
+		opt.apply(&cfg)
+	}
+
+	var rules []rbacv1.PolicyRule
+	if !allowed.allowAll {
+		rules = make([]rbacv1.PolicyRule, len(allowed.rules))
+		for i := range allowed.rules {
+			rules[i] = *allowed.rules[i].DeepCopy()
+		}
+	}
+	// When allowed.allowAll is true, rules stays nil (no ceiling enforcement).
+
+	return cfg, rules, nil
 }
 
 // isDeniedNamespace checks if ns matches any denied namespace pattern.

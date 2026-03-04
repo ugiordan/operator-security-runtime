@@ -37,42 +37,17 @@ func NewRBACScoper(
 	allowed AllowedRules,
 	opts ...Option,
 ) (*RBACScoper, error) {
-	if cl == nil {
-		return nil, fmt.Errorf("client must not be nil")
-	}
 	if scheme == nil {
 		return nil, fmt.Errorf("scheme must not be nil")
 	}
-	if identity.Name == "" {
-		return nil, fmt.Errorf("OperatorIdentity.Name must not be empty")
+	cfg, rules, err := validateCoreInputs(cl, identity, allowed, opts)
+	if err != nil {
+		return nil, err
 	}
-	if identity.ServiceAccount == "" {
-		return nil, fmt.Errorf("OperatorIdentity.ServiceAccount must not be empty")
-	}
-	if identity.Namespace == "" {
-		return nil, fmt.Errorf("OperatorIdentity.Namespace must not be empty")
-	}
-	if !allowed.allowAll && len(allowed.rules) == 0 {
-		return nil, fmt.Errorf("AllowedRules must not be empty")
-	}
-
-	cfg := defaultScopeConfig()
-	for _, opt := range opts {
-		opt.apply(&cfg)
-	}
-
-	var rules []rbacv1.PolicyRule
 	if allowed.allowAll {
-		rules = nil // will be set per-call
 		ctrl.Log.Info("RBACScoper created with AllowAllRules - no ceiling enforcement",
 			"operatorName", identity.Name)
-	} else {
-		rules = make([]rbacv1.PolicyRule, len(allowed.rules))
-		for i := range allowed.rules {
-			rules[i] = *allowed.rules[i].DeepCopy()
-		}
 	}
-
 	return &RBACScoper{
 		client:              cl,
 		scheme:              scheme,
