@@ -25,6 +25,7 @@ type RBACScoper struct {
 	operatorSANamespace string
 	rules               []rbacv1.PolicyRule
 	config              scopeConfig
+	ownerTracker        annotationOwnerTracker
 }
 
 // NewRBACScoper creates a validated RBACScoper. All required parameters are
@@ -80,6 +81,7 @@ func NewRBACScoper(
 		operatorSANamespace: identity.Namespace,
 		rules:               rules,
 		config:              cfg,
+		ownerTracker:        annotationOwnerTracker{annotationKey: ownerAnnotationKey},
 	}, nil
 }
 
@@ -100,6 +102,10 @@ func (s *RBACScoper) labels() map[string]string {
 
 // EnsureAccess creates or updates a Role and RoleBinding in the owner's
 // namespace so that the operator ServiceAccount has the configured access there.
+// Note: DeniedNamespace checks are NOT applied here because the CR's
+// existence in its own namespace implies the operator has legitimate reasons
+// to access resources there. DeniedNamespace enforcement applies only to
+// cross-namespace grants via EnsureAccessInNamespace.
 func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
 	log := ctrl.LoggerFrom(ctx)
 	ns := owner.GetNamespace()
@@ -109,12 +115,16 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
-	if err := s.ensureRole(ctx, owner, ns); err != nil {
+	ownerRefFn := func(obj client.Object, o client.Object) error {
+		return controllerutil.SetOwnerReference(o, obj, s.scheme)
+	}
+
+	if err := s.ensureRoleWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
 		return fmt.Errorf("ensuring Role in namespace %s: %w", ns, err)
 	}
 	log.Info("ensured Role", "namespace", ns, "role", s.roleName())
 
-	if err := s.ensureRoleBinding(ctx, owner, ns); err != nil {
+	if err := s.ensureRoleBindingWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
 		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", ns, err)
 	}
 	log.Info("ensured RoleBinding", "namespace", ns, "roleBinding", s.roleBindingName())
@@ -122,7 +132,15 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 	return nil
 }
 
-func (s *RBACScoper) ensureRole(ctx context.Context, owner client.Object, ns string) error {
+// ensureRoleWithOwnership creates or updates a Role in ns, using the provided
+// setOwnership function to set either OwnerReferences (same-namespace) or
+// annotation-based ownership (cross-namespace).
+func (s *RBACScoper) ensureRoleWithOwnership(
+	ctx context.Context,
+	owner client.Object,
+	ns string,
+	setOwnership func(obj client.Object, owner client.Object) error,
+) error {
 	log := ctrl.LoggerFrom(ctx)
 	role := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
@@ -136,17 +154,24 @@ func (s *RBACScoper) ensureRole(ctx context.Context, owner client.Object, ns str
 		for i := range s.rules {
 			role.Rules[i] = *s.rules[i].DeepCopy()
 		}
-		// Append this CR as an owner (does not overwrite existing owners)
-		return controllerutil.SetOwnerReference(owner, role, s.scheme)
+		return setOwnership(role, owner)
 	})
 	if err != nil {
-		return fmt.Errorf("failed to %s Role %s/%s: %w", result, ns, s.roleName(), err)
+		return fmt.Errorf("reconciling Role %s/%s: %w", ns, s.roleName(), err)
 	}
 	log.Info("scoped Role reconciled", "namespace", ns, "role", s.roleName(), "result", result)
 	return nil
 }
 
-func (s *RBACScoper) ensureRoleBinding(ctx context.Context, owner client.Object, ns string) error {
+// ensureRoleBindingWithOwnership creates or updates a RoleBinding in ns,
+// using the provided setOwnership function. Includes drift recovery for
+// immutable RoleRef changes.
+func (s *RBACScoper) ensureRoleBindingWithOwnership(
+	ctx context.Context,
+	owner client.Object,
+	ns string,
+	setOwnership func(obj client.Object, owner client.Object) error,
+) error {
 	log := ctrl.LoggerFrom(ctx)
 	rb := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -166,7 +191,7 @@ func (s *RBACScoper) ensureRoleBinding(ctx context.Context, owner client.Object,
 			Kind:     "Role",
 			Name:     s.roleName(),
 		}
-		return controllerutil.SetOwnerReference(owner, rb, s.scheme)
+		return setOwnership(rb, owner)
 	}
 	result, err := controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
 	if err != nil {
@@ -187,10 +212,10 @@ func (s *RBACScoper) ensureRoleBinding(ctx context.Context, owner client.Object,
 			}
 			result, err = controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
 			if err != nil {
-				return fmt.Errorf("failed to recreate RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
+				return fmt.Errorf("recreating RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
 			}
 		} else {
-			return fmt.Errorf("failed to %s RoleBinding %s/%s: %w", result, ns, s.roleBindingName(), err)
+			return fmt.Errorf("reconciling RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
 		}
 	}
 	log.Info("scoped RoleBinding reconciled", "namespace", ns, "rolebinding", s.roleBindingName(), "result", result)
@@ -265,4 +290,153 @@ func (s *RBACScoper) removeOwnerRef(obj client.Object, owner client.Object) {
 		}
 	}
 	obj.SetOwnerReferences(filtered)
+}
+
+// EnsureAccessInNamespace creates/updates a Role and RoleBinding in
+// targetNS for the owner. Uses annotation-based ownership because
+// cross-namespace OwnerReferences are not supported by Kubernetes.
+// If targetNS is the same as the owner's namespace, this delegates
+// to EnsureAccess (which uses OwnerReferences).
+func (s *RBACScoper) EnsureAccessInNamespace(
+	ctx context.Context,
+	owner client.Object,
+	targetNS string,
+) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	if owner.GetNamespace() == "" {
+		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
+			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
+	}
+
+	if targetNS == "" {
+		return fmt.Errorf("targetNS must not be empty")
+	}
+
+	// If targetNS is the owner's namespace, delegate to EnsureAccess (uses OwnerReferences).
+	// This must be checked before the denied namespace check so that
+	// EnsureAccessInNamespace(ctx, cr, cr.GetNamespace()) behaves identically
+	// to EnsureAccess(ctx, cr), including not rejecting the owner's own namespace.
+	if targetNS == owner.GetNamespace() {
+		return s.EnsureAccess(ctx, owner)
+	}
+
+	if s.isDeniedNamespace(targetNS) {
+		return fmt.Errorf("namespace %q is denied by configuration", targetNS)
+	}
+
+	annotationFn := func(obj client.Object, o client.Object) error {
+		return s.ownerTracker.addOwner(obj, o)
+	}
+
+	if err := s.ensureRoleWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
+		return fmt.Errorf("ensuring Role in namespace %s: %w", targetNS, err)
+	}
+	log.Info("ensured cross-namespace Role", "namespace", targetNS, "role", s.roleName())
+
+	if err := s.ensureRoleBindingWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
+		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", targetNS, err)
+	}
+	log.Info("ensured cross-namespace RoleBinding", "namespace", targetNS, "roleBinding", s.roleBindingName())
+
+	return nil
+}
+
+// TODO(Phase 3+): Implement GarbageCollectOrphanedOwners to handle
+// force-deleted CRs, controller crashes during cleanup, and annotation
+// corruption. The GC should list managed resources by label, parse
+// annotation entries, resolve each to a CR, and remove stale entries.
+// See design doc Section 3.4.
+
+// CleanupAllAccess removes the owner's references from all managed
+// Roles and RoleBindings across namespaces. Uses label-selected listing
+// to find managed resources. For same-namespace resources, removes
+// OwnerReferences. For cross-namespace resources, removes annotation entries.
+// Resources with no remaining owners (no OwnerReferences AND no annotation
+// entries) are deleted.
+func (s *RBACScoper) CleanupAllAccess(ctx context.Context, owner client.Object) error {
+	if owner.GetNamespace() == "" {
+		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
+			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
+	}
+
+	// Note: This lists all managed Roles/RoleBindings cluster-wide.
+	// For operators managing many namespaces, consider adding pagination
+	// via client.Limit/client.Continue.
+
+	// Cleanup all managed Roles
+	roleList := &rbacv1.RoleList{}
+	if err := s.client.List(ctx, roleList, client.MatchingLabels(s.labels())); err != nil {
+		return fmt.Errorf("listing managed Roles: %w", err)
+	}
+	for i := range roleList.Items {
+		if roleList.Items[i].Name != s.roleName() {
+			continue
+		}
+		if err := s.cleanupManagedResource(ctx, &roleList.Items[i], owner, &s.ownerTracker, "Role"); err != nil {
+			return err
+		}
+	}
+
+	// Cleanup all managed RoleBindings
+	rbList := &rbacv1.RoleBindingList{}
+	if err := s.client.List(ctx, rbList, client.MatchingLabels(s.labels())); err != nil {
+		return fmt.Errorf("listing managed RoleBindings: %w", err)
+	}
+	for i := range rbList.Items {
+		if rbList.Items[i].Name != s.roleBindingName() {
+			continue
+		}
+		if err := s.cleanupManagedResource(ctx, &rbList.Items[i], owner, &s.ownerTracker, "RoleBinding"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// cleanupManagedResource removes the owner from a managed resource.
+// For same-namespace resources, removes the OwnerReference.
+// For cross-namespace resources, removes the annotation entry.
+// If no owners remain (no OwnerReferences AND no annotation entries),
+// the resource is deleted.
+func (s *RBACScoper) cleanupManagedResource(
+	ctx context.Context,
+	obj client.Object,
+	owner client.Object,
+	tracker *annotationOwnerTracker,
+	kind string,
+) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Always try both ownership mechanisms: the resource might have been
+	// created via either EnsureAccess (OwnerReferences) or
+	// EnsureAccessInNamespace (annotations).
+	s.removeOwnerRef(obj, owner)
+	tracker.removeOwner(obj, owner)
+
+	// Check if any owners remain (either OwnerReferences or annotation entries)
+	hasOwnerRefs := len(obj.GetOwnerReferences()) > 0
+	hasAnnotationOwners := tracker.hasOwners(obj)
+
+	if !hasOwnerRefs && !hasAnnotationOwners {
+		if err := s.client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("deleting %s %s/%s: %w", kind, obj.GetNamespace(), obj.GetName(), err)
+		}
+		log.Info("deleted scoped "+kind+" (no owners remain)", "namespace", obj.GetNamespace())
+		return nil
+	}
+
+	if err := s.client.Update(ctx, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("resource already deleted during cleanup", "kind", kind, "namespace", obj.GetNamespace())
+			return nil
+		}
+		return fmt.Errorf("updating %s %s/%s to remove owner: %w", kind, obj.GetNamespace(), obj.GetName(), err)
+	}
+	log.Info("removed owner from "+kind+" (other owners remain)",
+		"namespace", obj.GetNamespace(),
+		"remainingOwnerRefs", len(obj.GetOwnerReferences()),
+		"hasAnnotationOwners", hasAnnotationOwners)
+	return nil
 }

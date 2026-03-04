@@ -2,6 +2,7 @@ package rbacscope
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,11 +33,6 @@ var testGVK = schema.GroupVersionKind{
 	Group:   "test.example.com",
 	Version: "v1alpha1",
 	Kind:    "TestResource",
-}
-
-func init() {
-	s := testScheme()
-	_ = s // ensure scheme is initialized
 }
 
 func testScheme() *runtime.Scheme {
@@ -883,5 +879,651 @@ func TestEnsureAccess_RoleBindingDriftRecovery(t *testing.T) {
 	// Verify the interceptor was triggered (the drift path was actually exercised).
 	if !updateRejected.Load() {
 		t.Error("expected the interceptor to reject at least one Update, but it was never triggered")
+	}
+}
+
+// --- Phase 2: Cross-Namespace Tests ---
+
+func TestEnsureAccessInNamespace_CreatesInTargetNS(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	// Owner lives in "owner-ns", target is "remote-ns"
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cross-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("cross-uid-1"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify Role was created in remote-ns (not owner-ns)
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access",
+		Namespace: "remote-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist in remote-ns, got error: %v", err)
+	}
+
+	// Verify Role has annotation-based ownership (not OwnerReferences)
+	if len(role.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences on cross-namespace Role, got %d", len(role.OwnerReferences))
+	}
+
+	annotations := role.GetAnnotations()
+	ownerAnnotation := annotations[ownerAnnotationKey]
+	expectedKey := "owner-ns/cross-cr/cross-uid-1"
+	if ownerAnnotation != expectedKey {
+		t.Errorf("expected owner annotation %q, got %q", expectedKey, ownerAnnotation)
+	}
+
+	// Verify Role rules match the scoper's configured rules
+	if len(role.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(role.Rules))
+	}
+	if role.Rules[0].Resources[0] != "secrets" {
+		t.Errorf("expected rule for secrets, got %v", role.Rules[0].Resources)
+	}
+
+	// Verify Role labels
+	if role.Labels["app.kubernetes.io/managed-by"] != "test-operator" {
+		t.Errorf("expected managed-by label = test-operator, got %q", role.Labels["app.kubernetes.io/managed-by"])
+	}
+	if role.Labels["app.kubernetes.io/component"] != "rbac-scoper" {
+		t.Errorf("expected component label = rbac-scoper, got %q", role.Labels["app.kubernetes.io/component"])
+	}
+
+	// Verify RoleBinding was created in remote-ns
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access-binding",
+		Namespace: "remote-ns",
+	}, rb); err != nil {
+		t.Fatalf("expected RoleBinding to exist in remote-ns, got error: %v", err)
+	}
+
+	// Verify RoleBinding has annotation-based ownership
+	if len(rb.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences on cross-namespace RoleBinding, got %d", len(rb.OwnerReferences))
+	}
+	rbAnnotation := rb.GetAnnotations()[ownerAnnotationKey]
+	if rbAnnotation != expectedKey {
+		t.Errorf("expected RoleBinding owner annotation %q, got %q", expectedKey, rbAnnotation)
+	}
+
+	// Verify RoleBinding RoleRef
+	if rb.RoleRef.Name != "test-operator-scoped-access" {
+		t.Errorf("expected RoleRef Name = test-operator-scoped-access, got %q", rb.RoleRef.Name)
+	}
+	if rb.RoleRef.APIGroup != "rbac.authorization.k8s.io" {
+		t.Errorf("expected RoleRef APIGroup = rbac.authorization.k8s.io, got %q", rb.RoleRef.APIGroup)
+	}
+
+	// Verify RoleBinding Subjects
+	if len(rb.Subjects) != 1 {
+		t.Fatalf("expected 1 Subject, got %d", len(rb.Subjects))
+	}
+	if rb.Subjects[0].Name != "test-operator-sa" {
+		t.Errorf("expected Subject Name = test-operator-sa, got %q", rb.Subjects[0].Name)
+	}
+	if rb.Subjects[0].Namespace != "operator-system" {
+		t.Errorf("expected Subject Namespace = operator-system, got %q", rb.Subjects[0].Namespace)
+	}
+}
+
+func TestEnsureAccessInNamespace_DelegatesForSameNamespace(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "same-ns-cr",
+			Namespace: "my-ns",
+			UID:       types.UID("same-ns-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// targetNS == owner's namespace should delegate to EnsureAccess
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "my-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify Role exists in the same namespace
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access",
+		Namespace: "my-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist in my-ns, got error: %v", err)
+	}
+
+	// Since it delegates to EnsureAccess, it should use OwnerReferences (NOT annotations)
+	if len(role.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 OwnerReference (delegated to EnsureAccess), got %d", len(role.OwnerReferences))
+	}
+	if role.OwnerReferences[0].Name != "same-ns-cr" {
+		t.Errorf("expected OwnerReference Name = same-ns-cr, got %q", role.OwnerReferences[0].Name)
+	}
+
+	// Should NOT have annotation-based ownership
+	annotations := role.GetAnnotations()
+	if annotations != nil {
+		if _, hasAnnotation := annotations[ownerAnnotationKey]; hasAnnotation {
+			t.Error("expected no owner annotation when delegating to same-namespace EnsureAccess")
+		}
+	}
+
+	// Verify RoleBinding uses OwnerReferences too
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access-binding",
+		Namespace: "my-ns",
+	}, rb); err != nil {
+		t.Fatalf("expected RoleBinding to exist in my-ns, got error: %v", err)
+	}
+	if len(rb.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 OwnerReference on RoleBinding (delegated), got %d", len(rb.OwnerReferences))
+	}
+}
+
+func TestEnsureAccessInNamespace_DeniedNamespace(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "denied-cr",
+			Namespace: "app-ns",
+			UID:       types.UID("denied-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// Test exact match: kube-system is in the default denied list
+	err := scoper.EnsureAccessInNamespace(ctx, cr, "kube-system")
+	if err == nil {
+		t.Fatal("expected error for denied namespace kube-system, got nil")
+	}
+	if !strings.Contains(err.Error(), "denied") {
+		t.Errorf("expected error about denied namespace, got %q", err.Error())
+	}
+
+	// Test prefix match: openshift- matches any namespace starting with "openshift-"
+	err = scoper.EnsureAccessInNamespace(ctx, cr, "openshift-monitoring")
+	if err == nil {
+		t.Fatal("expected error for denied namespace openshift-monitoring, got nil")
+	}
+	if !strings.Contains(err.Error(), "denied") {
+		t.Errorf("expected error about denied namespace, got %q", err.Error())
+	}
+
+	// Test another prefix match
+	err = scoper.EnsureAccessInNamespace(ctx, cr, "openshift-ingress")
+	if err == nil {
+		t.Fatal("expected error for denied namespace openshift-ingress, got nil")
+	}
+
+	// Test exact match: default
+	err = scoper.EnsureAccessInNamespace(ctx, cr, "default")
+	if err == nil {
+		t.Fatal("expected error for denied namespace default, got nil")
+	}
+
+	// Test non-denied namespace should succeed
+	err = scoper.EnsureAccessInNamespace(ctx, cr, "my-app-ns")
+	if err != nil {
+		t.Fatalf("expected non-denied namespace to succeed, got error: %v", err)
+	}
+}
+
+func TestEnsureAccessInNamespace_Idempotent(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "idem-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("idem-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// First call
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns"); err != nil {
+		t.Fatalf("first EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Second call should not error and should not duplicate annotations
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns"); err != nil {
+		t.Fatalf("second EnsureAccessInNamespace returned error: %v", err)
+	}
+
+	// Verify Role still exists with exactly one annotation entry
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access",
+		Namespace: "remote-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist: %v", err)
+	}
+
+	ownerAnnotation := role.GetAnnotations()[ownerAnnotationKey]
+	expectedKey := "owner-ns/idem-cr/idem-uid"
+	if ownerAnnotation != expectedKey {
+		t.Errorf("expected single owner annotation %q, got %q (possible duplication)", expectedKey, ownerAnnotation)
+	}
+
+	// Verify RoleBinding also has exactly one annotation entry
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access-binding",
+		Namespace: "remote-ns",
+	}, rb); err != nil {
+		t.Fatalf("expected RoleBinding to exist: %v", err)
+	}
+
+	rbAnnotation := rb.GetAnnotations()[ownerAnnotationKey]
+	if rbAnnotation != expectedKey {
+		t.Errorf("expected single owner annotation on RoleBinding %q, got %q", expectedKey, rbAnnotation)
+	}
+}
+
+func TestCleanupAllAccess_CleansAcrossNamespaces(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multi-ns-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("multi-ns-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// Create access in same namespace (uses OwnerReferences)
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "owner-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace (same-ns) failed: %v", err)
+	}
+
+	// Create access in remote namespace (uses annotations)
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns-1"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace (remote-ns-1) failed: %v", err)
+	}
+	if err := scoper.EnsureAccessInNamespace(ctx, cr, "remote-ns-2"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace (remote-ns-2) failed: %v", err)
+	}
+
+	// Cleanup all access
+	if err := scoper.CleanupAllAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupAllAccess returned error: %v", err)
+	}
+
+	// Verify all Roles and RoleBindings are gone
+	for _, ns := range []string{"owner-ns", "remote-ns-1", "remote-ns-2"} {
+		role := &rbacv1.Role{}
+		err := scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access", Namespace: ns,
+		}, role)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected Role in %s to be deleted, got err=%v", ns, err)
+		}
+
+		rb := &rbacv1.RoleBinding{}
+		err = scoper.client.Get(ctx, types.NamespacedName{
+			Name: "test-operator-scoped-access-binding", Namespace: ns,
+		}, rb)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected RoleBinding in %s to be deleted, got err=%v", ns, err)
+		}
+	}
+}
+
+func TestCleanupAllAccess_MultiOwnerAnnotation(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	// Two owners from different namespaces, both granting access to the same remote-ns
+	cr1 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-alpha",
+			Namespace: "ns-alpha",
+			UID:       types.UID("uid-alpha"),
+		},
+	}
+	cr1.SetGroupVersionKind(testGVK)
+
+	cr2 := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cr-beta",
+			Namespace: "ns-beta",
+			UID:       types.UID("uid-beta"),
+		},
+	}
+	cr2.SetGroupVersionKind(testGVK)
+
+	// Both grant access to the same remote namespace
+	if err := scoper.EnsureAccessInNamespace(ctx, cr1, "shared-remote"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace for cr1 failed: %v", err)
+	}
+	if err := scoper.EnsureAccessInNamespace(ctx, cr2, "shared-remote"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace for cr2 failed: %v", err)
+	}
+
+	// Verify both owners are in the annotation
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist: %v", err)
+	}
+	annotation := role.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(annotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected annotation to contain cr1's key, got %q", annotation)
+	}
+	if !strings.Contains(annotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected annotation to contain cr2's key, got %q", annotation)
+	}
+
+	// Cleanup only cr1
+	if err := scoper.CleanupAllAccess(ctx, cr1); err != nil {
+		t.Fatalf("CleanupAllAccess for cr1 failed: %v", err)
+	}
+
+	// Role should still exist with cr2's annotation
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role); err != nil {
+		t.Fatal("Role was deleted when another owner (cr2) still exists")
+	}
+	remainingAnnotation := role.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(remainingAnnotation, "ns-beta/cr-beta/uid-beta") {
+		t.Errorf("expected remaining annotation to contain cr2's key, got %q", remainingAnnotation)
+	}
+	if strings.Contains(remainingAnnotation, "ns-alpha/cr-alpha/uid-alpha") {
+		t.Errorf("expected cr1's key to be removed from annotation, got %q", remainingAnnotation)
+	}
+
+	// RoleBinding should also still exist
+	rb := &rbacv1.RoleBinding{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "shared-remote",
+	}, rb); err != nil {
+		t.Fatal("RoleBinding was deleted when another owner (cr2) still exists")
+	}
+
+	// Cleanup cr2 -- now everything should be deleted
+	if err := scoper.CleanupAllAccess(ctx, cr2); err != nil {
+		t.Fatalf("CleanupAllAccess for cr2 failed: %v", err)
+	}
+
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access", Namespace: "shared-remote",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted after all owners cleaned up, got err=%v", err)
+	}
+
+	err = scoper.client.Get(ctx, types.NamespacedName{
+		Name: "test-operator-scoped-access-binding", Namespace: "shared-remote",
+	}, rb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected RoleBinding to be deleted after all owners cleaned up, got err=%v", err)
+	}
+}
+
+func TestCleanupAllAccess_NoResourcesExist(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nonexistent-cr",
+			Namespace: "some-ns",
+			UID:       types.UID("nonexistent-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	// CleanupAllAccess when no managed resources exist should not error
+	if err := scoper.CleanupAllAccess(ctx, cr); err != nil {
+		t.Fatalf("CleanupAllAccess returned error when no resources exist: %v", err)
+	}
+}
+
+func TestIsDeniedNamespace(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	allowed, _ := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"},
+	})
+
+	// Default denied list includes: kube-system, kube-public, kube-node-lease, default, openshift-
+	scoper, err := NewRBACScoper(cl, s,
+		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
+		allowed,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		ns       string
+		expected bool
+	}{
+		// Exact matches
+		{"kube-system", true},
+		{"kube-public", true},
+		{"kube-node-lease", true},
+		{"default", true},
+		// Prefix matches (openshift-)
+		{"openshift-monitoring", true},
+		{"openshift-ingress", true},
+		{"openshift-operators", true},
+		{"openshift-", true}, // the prefix itself also matches
+		// Non-denied namespaces
+		{"my-app", false},
+		{"production", false},
+		{"kube", false},           // "kube" alone is not denied (not exact match for kube-system)
+		{"defaulting", false},     // "defaulting" is not "default"
+		{"openshift", false},      // "openshift" without trailing "-" doesn't match "openshift-"
+		{"not-openshift-ns", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.ns, func(t *testing.T) {
+			result := scoper.isDeniedNamespace(tt.ns)
+			if result != tt.expected {
+				t.Errorf("isDeniedNamespace(%q) = %v, want %v", tt.ns, result, tt.expected)
+			}
+		})
+	}
+
+	// Test with custom denied namespaces
+	scoper2, err := NewRBACScoper(cl, s,
+		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
+		allowed,
+		WithDeniedNamespaces("custom-ns", "prefix-"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !scoper2.isDeniedNamespace("custom-ns") {
+		t.Error("expected custom-ns to be denied")
+	}
+	if !scoper2.isDeniedNamespace("prefix-something") {
+		t.Error("expected prefix-something to be denied via prefix match")
+	}
+	if scoper2.isDeniedNamespace("kube-system") {
+		t.Error("kube-system should NOT be denied when custom list replaces defaults")
+	}
+}
+
+func TestEnsureAccessInNamespace_RejectsClusterScopedOwner(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	// Create a cluster-scoped resource (no namespace)
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-scoped-cr",
+			UID:  types.UID("cluster-uid"),
+			// No Namespace -- cluster-scoped
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	// EnsureAccessInNamespace should reject cluster-scoped owners
+	err := scoper.EnsureAccessInNamespace(ctx, clusterCR, "some-target-ns")
+	if err == nil {
+		t.Fatal("expected error for cluster-scoped owner in EnsureAccessInNamespace, got nil")
+	}
+	if !strings.Contains(err.Error(), "namespace-scoped") {
+		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	}
+
+	// CleanupAllAccess should also reject cluster-scoped owners
+	err = scoper.CleanupAllAccess(ctx, clusterCR)
+	if err == nil {
+		t.Fatal("expected error from CleanupAllAccess for cluster-scoped owner, got nil")
+	}
+	if !strings.Contains(err.Error(), "namespace-scoped") {
+		t.Errorf("CleanupAllAccess: expected error about namespace-scoped, got %q", err.Error())
+	}
+}
+
+func TestAddOwner_MaxAnnotationOwnersLimit(t *testing.T) {
+	tracker := &annotationOwnerTracker{annotationKey: ownerAnnotationKey}
+
+	obj := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "limit-test",
+			Namespace: "test-ns",
+		},
+	}
+
+	// Add maxAnnotationOwners owners (should all succeed)
+	for i := 0; i < maxAnnotationOwners; i++ {
+		owner := &testResource{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("owner-%d", i),
+				Namespace: "owner-ns",
+				UID:       types.UID(fmt.Sprintf("uid-%d", i)),
+			},
+		}
+		if err := tracker.addOwner(obj, owner); err != nil {
+			t.Fatalf("addOwner failed at i=%d: %v", i, err)
+		}
+	}
+
+	// The 101st addition should return an error
+	extraOwner := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "owner-overflow",
+			Namespace: "owner-ns",
+			UID:       types.UID("uid-overflow"),
+		},
+	}
+	err := tracker.addOwner(obj, extraOwner)
+	if err == nil {
+		t.Fatal("expected error when exceeding maxAnnotationOwners, got nil")
+	}
+	if !strings.Contains(err.Error(), "maximum owner count") {
+		t.Errorf("expected error about maximum owner count, got %q", err.Error())
+	}
+}
+
+func TestEnsureAccessInNamespace_EmptyTargetNS(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "empty-target-cr",
+			Namespace: "owner-ns",
+			UID:       types.UID("empty-target-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+
+	err := scoper.EnsureAccessInNamespace(ctx, cr, "")
+	if err == nil {
+		t.Fatal("expected error for empty targetNS, got nil")
+	}
+	if !strings.Contains(err.Error(), "targetNS must not be empty") {
+		t.Errorf("expected error containing 'targetNS must not be empty', got %q", err.Error())
+	}
+}
+
+func TestEnsureAccess_AllowAllRulesProducesEmptyRole(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+
+	scoper, err := NewRBACScoper(
+		cl,
+		s,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		AllowAllRules(),
+	)
+	if err != nil {
+		t.Fatalf("NewRBACScoper failed: %v", err)
+	}
+
+	cr := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "allowall-cr",
+			Namespace: "target-ns",
+			UID:       types.UID("allowall-uid"),
+		},
+	}
+	cr.SetGroupVersionKind(testGVK)
+	ctx := context.Background()
+
+	if err := scoper.EnsureAccess(ctx, cr); err != nil {
+		t.Fatalf("EnsureAccess returned error: %v", err)
+	}
+
+	// Verify the Role was created with zero rules (documents current behavior)
+	role := &rbacv1.Role{}
+	if err := cl.Get(ctx, types.NamespacedName{
+		Name:      "test-operator-scoped-access",
+		Namespace: "target-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist, got error: %v", err)
+	}
+
+	if len(role.Rules) != 0 {
+		t.Errorf("expected 0 rules with AllowAllRules (documents current behavior), got %d", len(role.Rules))
 	}
 }
