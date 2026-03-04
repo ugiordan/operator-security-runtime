@@ -70,7 +70,7 @@ Any Kubernetes operator with elevated RBAC permissions is affected. Operators ty
 A defense-in-depth approach with three complementary mechanisms:
 
 1. **SA Identity Protection (ValidatingWebhook)** -- Enforces creator identity checks at pod admission time, preventing unauthorized ServiceAccount usage.
-2. **Dynamic RBAC Scoping** -- Replaces static cluster-wide secrets access with namespace-scoped grants tied to CR lifecycle.
+2. **Dynamic RBAC Scoping** -- Replaces static cluster-wide resource access with namespace-scoped and cluster-scoped grants tied to CR lifecycle, including cross-namespace and cluster-scoped variants.
 3. **Impersonation Guard (Reconciler)** -- Strips the `impersonate` verb from `system:aggregate-to-edit`, closing the impersonation bypass that would otherwise allow any namespace editor to circumvent the webhook.
 
 ### Alternatives Considered
@@ -272,6 +272,81 @@ Required ClusterRole permissions:
 | Model Registry | N/A | N/A | N/A | N/A |
 
 The `Rules` field accepts any `[]rbacv1.PolicyRule`, so operators that need access to multiple resource types (e.g., secrets and configmaps) can express this in a single `RBACScoper` instance. Dashboard does not use a CR-based pattern, so a different approach is needed. Model Registry does not access secrets at all.
+
+### Cross-Namespace Grants
+
+Operators sometimes need access to resources in namespaces other than the CR's own namespace. `RBACScoper.EnsureAccessInNamespace` creates Roles and RoleBindings in arbitrary target namespaces using annotation-based ownership (since Kubernetes OwnerReferences cannot cross namespace boundaries). If the target namespace matches the CR's own namespace, it delegates to `EnsureAccess` (using OwnerReferences).
+
+Cross-namespace grants are subject to denied-namespace enforcement. By default, the scoper denies grants to `kube-system`, `kube-public`, `kube-node-lease`, `default`, and namespaces with the `openshift-` prefix. Use `WithDeniedNamespaces` or `WithAdditionalDeniedNamespaces` options to customize.
+
+```mermaid
+flowchart TD
+    A["EnsureAccessInNamespace(ctx, cr, targetNS)"] --> B{targetNS == cr.Namespace?}
+    B -- Yes --> C["Delegate to EnsureAccess\n(OwnerReferences)"]
+    B -- No --> D{Denied namespace?}
+    D -- Yes --> E[Return error]
+    D -- No --> F["Create Role+RoleBinding in targetNS\n(annotation-based ownership)"]
+
+    G["CleanupAllAccess(ctx, cr)"] --> H["List managed Roles/RoleBindings by label"]
+    H --> I["For each: remove OwnerRef + annotation"]
+    I --> J{Any owners remain?}
+    J -- Yes --> K[Update resource]
+    J -- No --> L[Delete resource]
+
+    style C fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#ffebee,stroke:#f44336
+    style F fill:#e8f5e9,stroke:#4CAF50
+```
+
+### Annotation-Based Ownership
+
+Cross-namespace Roles and cluster-scoped ClusterRoles cannot use Kubernetes OwnerReferences (which require the owner to be in the same namespace). Instead, the library uses a custom annotation `opendatahub.io/scoped-access-owners` with comma-separated `namespace/name/uid` entries:
+
+```yaml
+metadata:
+  annotations:
+    opendatahub.io/scoped-access-owners: "ns-alpha/cr-alpha/uid-alpha,ns-beta/cr-beta/uid-beta"
+```
+
+Key properties:
+- **Idempotent:** Adding the same owner twice is a no-op.
+- **Multi-owner:** Multiple CRs can share the same Role/ClusterRole.
+- **Size-limited:** Maximum 100 owner entries per resource to prevent unbounded growth.
+- **Optimistic concurrency:** Uses `CreateOrUpdate` with `resourceVersion` to prevent concurrent overwrites.
+
+### Cluster-Scoped Grants (ClusterRBACScoper)
+
+For resources that require cluster-wide access (e.g., `nodes`, `namespaces`, `persistentvolumes`), `ClusterRBACScoper` manages ClusterRoles and ClusterRoleBindings. It uses annotation-based ownership exclusively because ClusterRoles are cluster-scoped and cannot have OwnerReferences pointing to namespaced resources.
+
+```mermaid
+flowchart TD
+    A[EnsureClusterAccess] --> B["Create/Update ClusterRole\noperator-cluster-scoped-access\nRules: configured PolicyRules\nAnnotation ownership"]
+    A --> C["Create/Update ClusterRoleBinding\noperator-cluster-scoped-access-binding\nSubject: operator SA\nAnnotation ownership"]
+    B --> D[Operator has cluster-wide access]
+    C --> D
+
+    E[CleanupClusterAccess] --> F["Remove owner annotation"]
+    F --> G{Other owners?}
+    G -- Yes --> H[Keep ClusterRole + ClusterRoleBinding]
+    G -- No --> I[Delete both]
+
+    style D fill:#e8f5e9,stroke:#4CAF50
+    style I fill:#ffebee,stroke:#f44336
+    style H fill:#e8f5e9,stroke:#4CAF50
+```
+
+`ClusterRBACScoper` does not take a `*runtime.Scheme` parameter because it never uses OwnerReferences. It shares the `OperatorIdentity`, `AllowedRules`, and `Option` types with `RBACScoper`. The `WithDeniedNamespaces` option has no effect on `ClusterRBACScoper` since ClusterRoles are not namespace-bound.
+
+Additional RBAC permissions required for cluster-scoped grants:
+
+```yaml
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  verbs: ["get", "list", "watch", "create", "update", "delete", "escalate"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
+```
 
 ### Out of Scope
 
@@ -589,3 +664,5 @@ To safely migrate from cluster-wide resource access to namespace-scoped:
 3. **Remove scoped resources from the static ClusterRole.** Once all namespaces are covered by scoped Roles, remove the scoped resource entries (e.g., `secrets`, `configmaps`) from the ClusterRole manifest and redeploy.
 
 This ordering ensures no disruption: at no point does the operator lose access to resources in namespaces where it has active CRs.
+
+4. **Adopt cross-namespace and cluster-scoped scoping.** If your operator needs access to resources in namespaces other than the CR's own namespace, use `EnsureAccessInNamespace`. For cluster-wide resources, use `ClusterRBACScoper`. Both use annotation-based ownership and follow the same ensure/cleanup lifecycle pattern.

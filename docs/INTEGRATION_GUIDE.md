@@ -6,8 +6,10 @@ security packages that can be adopted together or separately:
 
 - **`pkg/saprotection`** -- A validating webhook that prevents unauthorized pods
   from using your operator's ServiceAccount.
-- **`pkg/rbacscope`** -- Dynamic, namespace-scoped RBAC that grants resource
-  access only where your Custom Resources exist.
+- **`pkg/rbacscope`** -- Dynamic RBAC scoping that grants resource access only
+  where your Custom Resources exist. Includes `RBACScoper` for namespace-scoped
+  Roles/RoleBindings (with cross-namespace support) and `ClusterRBACScoper` for
+  cluster-scoped ClusterRoles/ClusterRoleBindings.
 - **`pkg/impersonationguard`** -- A reconciler that strips the `impersonate`
   verb from `system:aggregate-to-edit`, closing the impersonation bypass.
 - **`pkg/rbacaudit`** -- A startup audit that detects impersonation and token
@@ -153,17 +155,31 @@ import (
     rbacv1 "k8s.io/api/rbac/v1"
 )
 
-rbacScoper := &rbacscope.RBACScoper{
-    Client:              mgr.GetClient(),
-    Scheme:              mgr.GetScheme(),
-    OperatorName:        os.Getenv("OPERATOR_NAME"),
-    OperatorSAName:      os.Getenv("OPERATOR_SA_NAME"),
-    OperatorSANamespace: os.Getenv("OPERATOR_NAMESPACE"),
-    Rules: []rbacv1.PolicyRule{{
-        APIGroups: []string{""},
-        Resources: []string{"secrets"},
-        Verbs:     []string{"get", "list", "watch"},
-    }},
+// Define the permission ceiling
+allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
+    APIGroups: []string{""},
+    Resources: []string{"secrets"},
+    Verbs:     []string{"get", "list", "watch"},
+})
+if err != nil {
+    setupLog.Error(err, "invalid allowed rules")
+    os.Exit(1)
+}
+
+// Create the scoper with constructor validation
+rbacScoper, err := rbacscope.NewRBACScoper(
+    mgr.GetClient(),
+    mgr.GetScheme(),
+    rbacscope.OperatorIdentity{
+        Name:           os.Getenv("OPERATOR_NAME"),
+        ServiceAccount: os.Getenv("OPERATOR_SA_NAME"),
+        Namespace:      os.Getenv("OPERATOR_NAMESPACE"),
+    },
+    allowed,
+)
+if err != nil {
+    setupLog.Error(err, "unable to create RBAC scoper")
+    os.Exit(1)
 }
 ```
 
@@ -300,6 +316,79 @@ the purpose of scoping.
 
 See Section 5 for a safe migration strategy.
 
+### 3.7 Cross-Namespace Access
+
+If your operator needs access to resources in namespaces other than the CR's
+own namespace (e.g., a controller in namespace A needs secrets from namespace B):
+
+```go
+// Grant access in a target namespace
+if err := r.RBACScoper.EnsureAccessInNamespace(ctx, cr, targetNS); err != nil {
+    return ctrl.Result{}, fmt.Errorf("ensuring cross-namespace access: %w", err)
+}
+```
+
+Cross-namespace grants use annotation-based ownership instead of
+OwnerReferences (since Kubernetes OwnerReferences cannot cross namespace
+boundaries). If `targetNS` equals the CR's own namespace, the call delegates
+to `EnsureAccess` (using OwnerReferences).
+
+For cleanup, use `CleanupAllAccess` which finds and cleans up all managed
+Roles and RoleBindings across namespaces:
+
+```go
+// In finalizer: clean up all managed access across all namespaces
+if err := r.RBACScoper.CleanupAllAccess(ctx, cr); err != nil {
+    return ctrl.Result{}, fmt.Errorf("cleaning up all access: %w", err)
+}
+```
+
+### 3.8 Cluster-Scoped Access
+
+For resources that require cluster-wide access (e.g., `nodes`, `namespaces`,
+`persistentvolumes`), use `ClusterRBACScoper`:
+
+```go
+import "github.com/opendatahub-io/operator-security-runtime/pkg/rbacscope"
+
+clusterScoper, err := rbacscope.NewClusterRBACScoper(
+    mgr.GetClient(),
+    rbacscope.OperatorIdentity{
+        Name:           os.Getenv("OPERATOR_NAME"),
+        ServiceAccount: os.Getenv("OPERATOR_SA_NAME"),
+        Namespace:      os.Getenv("OPERATOR_NAMESPACE"),
+    },
+    allowed,
+)
+if err != nil {
+    setupLog.Error(err, "unable to create cluster RBAC scoper")
+    os.Exit(1)
+}
+```
+
+In your reconciler:
+
+```go
+// Ensure cluster-scoped access
+if err := r.ClusterRBACScoper.EnsureClusterAccess(ctx, cr); err != nil {
+    return ctrl.Result{}, fmt.Errorf("ensuring cluster access: %w", err)
+}
+
+// In finalizer
+if err := r.ClusterRBACScoper.CleanupClusterAccess(ctx, cr); err != nil {
+    return ctrl.Result{}, fmt.Errorf("cleaning up cluster access: %w", err)
+}
+```
+
+`ClusterRBACScoper` does not require a `*runtime.Scheme` parameter because
+it uses annotation-based ownership exclusively. Additional RBAC permissions
+are required:
+
+```go
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;delete;escalate
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;delete
+```
+
 ---
 
 ## 4. Configuration
@@ -325,54 +414,77 @@ env:
 
 ### Custom Rules
 
-The `Rules` field accepts any `[]rbacv1.PolicyRule`, controlling exactly what
-the scoped Role grants. Use read-only secrets access for operators that only
-consume secrets:
+The `NewAllowedRules` function accepts any number of `rbacv1.PolicyRule`
+arguments, controlling exactly what the scoped Role grants. Use read-only
+secrets access for operators that only consume secrets:
 
 ```go
-Rules: []rbacv1.PolicyRule{{
+allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
     APIGroups: []string{""},
     Resources: []string{"secrets"},
     Verbs:     []string{"get", "list", "watch"},
-}}
+})
 ```
 
 For operators that need access to multiple resource types:
 
 ```go
-Rules: []rbacv1.PolicyRule{
-    {
+allowed, err := rbacscope.NewAllowedRules(
+    rbacv1.PolicyRule{
         APIGroups: []string{""},
         Resources: []string{"secrets"},
         Verbs:     []string{"get", "list", "watch"},
     },
-    {
+    rbacv1.PolicyRule{
         APIGroups: []string{""},
         Resources: []string{"configmaps"},
         Verbs:     []string{"get", "list"},
     },
-}
+)
 ```
+
+### Denied Namespaces
+
+By default, cross-namespace grants are denied for `kube-system`, `kube-public`,
+`kube-node-lease`, `default`, and namespaces with the `openshift-` prefix.
+Customize with options:
+
+```go
+// Replace the entire denied list
+scoper, err := rbacscope.NewRBACScoper(
+    cl, scheme, identity, allowed,
+    rbacscope.WithDeniedNamespaces("custom-system", "custom-"),
+)
+
+// Append to the defaults
+scoper, err := rbacscope.NewRBACScoper(
+    cl, scheme, identity, allowed,
+    rbacscope.WithAdditionalDeniedNamespaces("istio-system"),
+)
+```
+
+Note: `WithDeniedNamespaces` and `WithAdditionalDeniedNamespaces` only apply
+to `RBACScoper`. They have no effect on `ClusterRBACScoper`.
 
 ### Cross-Controller CRD Access
 
-The `Rules` field is not limited to core resources. If your controller needs
+The allowed rules are not limited to core resources. If your controller needs
 scoped access to Custom Resources managed by a different controller, include
 the CRD's API group in the rules:
 
 ```go
-Rules: []rbacv1.PolicyRule{
-    {
+allowed, err := rbacscope.NewAllowedRules(
+    rbacv1.PolicyRule{
         APIGroups: []string{""},
         Resources: []string{"secrets"},
         Verbs:     []string{"get", "list", "watch"},
     },
-    {
+    rbacv1.PolicyRule{
         APIGroups: []string{"mlflow.example.com"},
         Resources: []string{"mlflowservers"},
         Verbs:     []string{"get", "list", "watch"},
     },
-}
+)
 ```
 
 When a FeatureStore CR is created in namespace X, the scoper grants the

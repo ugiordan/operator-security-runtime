@@ -2,8 +2,8 @@
 
 A Go library providing defense-in-depth mechanisms for hardening Kubernetes
 operator ServiceAccounts: **SA Identity Protection** (ValidatingWebhook),
-**Dynamic RBAC Scoping** (namespace-scoped Roles/RoleBindings tied to CR
-lifecycle), **Impersonation Guard** (reconciler that strips the `impersonate`
+**Dynamic RBAC Scoping** (namespace-scoped Roles/RoleBindings and cluster-scoped
+ClusterRoles/ClusterRoleBindings tied to CR lifecycle), **Impersonation Guard** (reconciler that strips the `impersonate`
 verb from `system:aggregate-to-edit`), and **RBAC Audit** (startup scan for
 impersonation and token-request exposure). All packages are independently
 usable and can be integrated into any controller-runtime based operator without
@@ -24,7 +24,7 @@ Independent mechanisms that address complementary gaps:
 | **Package** | `pkg/saprotection` | `pkg/rbacscope` | `pkg/impersonationguard` |
 | **Controls** | **WHO** can use the operator's identity | **WHERE** the operator has permissions | **HOW** identity can be assumed |
 | **Answer** | Only the operator itself | Only namespaces with active CRs | Only explicitly authorized users |
-| **Mechanism** | ValidatingWebhook on Pod CREATE/UPDATE | Namespace-scoped Role/RoleBinding tied to CR lifecycle | Reconciler strips impersonate from system:aggregate-to-edit |
+| **Mechanism** | ValidatingWebhook on Pod CREATE/UPDATE | Namespace/cluster-scoped Role/RoleBinding tied to CR lifecycle | Reconciler strips impersonate from system:aggregate-to-edit |
 
 > **Together:** unauthorized users can't use the SA, the SA's permissions
 > are limited to namespaces where work is happening, and the impersonation
@@ -57,15 +57,14 @@ flowchart TD
 
 ### `pkg/rbacscope`
 
-Dynamic RBAC scoping that creates namespace-scoped Roles and RoleBindings for
-resource access only in namespaces where operator CRs exist. When a CR is
-created in a namespace, the scoper creates a Role with the configured
-`PolicyRules` and a RoleBinding binding that Role to the operator's
-ServiceAccount. When the CR is deleted (typically via a finalizer), the scoper
-removes both the Role and the RoleBinding. This replaces static cluster-wide
-resource access with minimal, just-in-time permissions scoped to the exact
-namespaces the operator needs. The scoper supports any combination of API
-groups, resources, and verbs via Kubernetes-native `rbacv1.PolicyRule` structs.
+Dynamic RBAC scoping that creates Roles, RoleBindings, ClusterRoles, and
+ClusterRoleBindings tied to CR lifecycle. `RBACScoper` manages namespace-scoped
+access: same-namespace grants use OwnerReferences, cross-namespace grants use
+annotation-based ownership. `ClusterRBACScoper` manages cluster-scoped access
+via ClusterRoles and ClusterRoleBindings with annotation-based ownership. When
+a CR is deleted (typically via a finalizer), both scopers revoke access. The
+scopers support any combination of API groups, resources, and verbs via
+Kubernetes-native `rbacv1.PolicyRule` structs.
 
 ```mermaid
 flowchart TD
@@ -96,6 +95,45 @@ flowchart TD
     style N fill:#ffebee,stroke:#f44336
     style M fill:#e8f5e9,stroke:#4CAF50
     style O fill:#e8f5e9,stroke:#4CAF50
+```
+
+**Cross-namespace scoping** -- `EnsureAccessInNamespace` grants access in a
+target namespace different from the owner's, using annotation-based ownership:
+
+```mermaid
+flowchart TD
+    A[CR in namespace alpha] --> B["EnsureAccessInNamespace(ctx, cr, 'beta')"]
+    B --> C["Create Role in beta\nannotation-based ownership"]
+    B --> D["Create RoleBinding in beta\nannotation-based ownership"]
+    C --> E[Operator has access in beta]
+    D --> E
+
+    style A fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#e8f5e9,stroke:#4CAF50
+```
+
+**Cluster-scoped access** -- `ClusterRBACScoper` manages ClusterRoles and
+ClusterRoleBindings for resources that require cluster-wide access (e.g.,
+nodes, namespaces):
+
+```mermaid
+flowchart TD
+    A[CR created] --> B[EnsureClusterAccess]
+    B --> C["Create/Update ClusterRole\nannotation-based ownership"]
+    B --> D["Create/Update ClusterRoleBinding\nannotation-based ownership"]
+    C --> E[Operator has cluster-wide access]
+    D --> E
+
+    F[CR deleted] --> G[CleanupClusterAccess]
+    G --> H{Other owners?}
+    H -- Yes --> I[Remove annotation, keep resources]
+    H -- No --> J[Delete ClusterRole + ClusterRoleBinding]
+
+    style A fill:#e8f5e9,stroke:#4CAF50
+    style E fill:#e8f5e9,stroke:#4CAF50
+    style F fill:#fff3e0,stroke:#FF9800
+    style J fill:#ffebee,stroke:#f44336
+    style I fill:#e8f5e9,stroke:#4CAF50
 ```
 
 **Multi-resource scoping** -- a single `RBACScoper` manages one Role per
@@ -169,7 +207,7 @@ matching authorized identity.
 
 ### Dynamic RBAC Scoping
 
-Initialize the scoper and call it from your reconciler:
+Initialize the scoper using the constructor API and call it from your reconciler:
 
 ```go
 import (
@@ -177,18 +215,26 @@ import (
     rbacv1 "k8s.io/api/rbac/v1"
 )
 
-scoper := &rbacscope.RBACScoper{
-    Client:              mgr.GetClient(),
-    Scheme:              mgr.GetScheme(),
-    OperatorName:        "my-operator",
-    OperatorSAName:      "my-operator-sa",
-    OperatorSANamespace: "my-operator-system",
-    Rules: []rbacv1.PolicyRule{{
-        APIGroups: []string{""},
-        Resources: []string{"secrets"},
-        Verbs:     []string{"get", "list", "watch"},
-    }},
-}
+// Define the permission ceiling
+allowed, err := rbacscope.NewAllowedRules(rbacv1.PolicyRule{
+    APIGroups: []string{""},
+    Resources: []string{"secrets"},
+    Verbs:     []string{"get", "list", "watch"},
+})
+if err != nil { ... }
+
+// Create the scoper
+scoper, err := rbacscope.NewRBACScoper(
+    mgr.GetClient(),
+    mgr.GetScheme(),
+    rbacscope.OperatorIdentity{
+        Name:           "my-operator",
+        ServiceAccount: "my-operator-sa",
+        Namespace:      "my-operator-system",
+    },
+    allowed,
+)
+if err != nil { ... }
 
 // In your reconciler:
 if err := scoper.EnsureAccess(ctx, cr); err != nil { ... }
@@ -199,28 +245,57 @@ if err := scoper.CleanupAccess(ctx, cr); err != nil { ... }
 
 `EnsureAccess` is idempotent. It creates the Role and RoleBinding if they do
 not exist, or updates them if the configuration has changed. `CleanupAccess`
-removes them entirely and should be called from your finalizer logic before
-removing the finalizer.
+removes the owner's OwnerReference and deletes the resources when no owners
+remain. Call it from your finalizer logic before removing the finalizer.
 
-Multiple resource types can be scoped in a single `RBACScoper` by providing
-multiple `PolicyRule` entries:
+For **cross-namespace** access (e.g., accessing resources in a different
+namespace than the CR's own namespace):
 
 ```go
-scoper := &rbacscope.RBACScoper{
-    // ...
-    Rules: []rbacv1.PolicyRule{
-        {
-            APIGroups: []string{""},
-            Resources: []string{"secrets"},
-            Verbs:     []string{"get", "list", "watch"},
-        },
-        {
-            APIGroups: []string{""},
-            Resources: []string{"configmaps"},
-            Verbs:     []string{"get", "list"},
-        },
+// Grant access in a target namespace different from the CR's namespace
+if err := scoper.EnsureAccessInNamespace(ctx, cr, targetNS); err != nil { ... }
+
+// Clean up all managed access across all namespaces for this CR
+if err := scoper.CleanupAllAccess(ctx, cr); err != nil { ... }
+```
+
+For **cluster-scoped** access (ClusterRoles/ClusterRoleBindings):
+
+```go
+clusterScoper, err := rbacscope.NewClusterRBACScoper(
+    mgr.GetClient(),
+    rbacscope.OperatorIdentity{
+        Name:           "my-operator",
+        ServiceAccount: "my-operator-sa",
+        Namespace:      "my-operator-system",
     },
-}
+    allowed,
+)
+if err != nil { ... }
+
+// In your reconciler:
+if err := clusterScoper.EnsureClusterAccess(ctx, cr); err != nil { ... }
+
+// During CR deletion:
+if err := clusterScoper.CleanupClusterAccess(ctx, cr); err != nil { ... }
+```
+
+Multiple resource types can be scoped in a single scoper by providing
+multiple `PolicyRule` entries to `NewAllowedRules`:
+
+```go
+allowed, err := rbacscope.NewAllowedRules(
+    rbacv1.PolicyRule{
+        APIGroups: []string{""},
+        Resources: []string{"secrets"},
+        Verbs:     []string{"get", "list", "watch"},
+    },
+    rbacv1.PolicyRule{
+        APIGroups: []string{""},
+        Resources: []string{"configmaps"},
+        Verbs:     []string{"get", "list"},
+    },
+)
 ```
 
 ### Impersonation Guard
