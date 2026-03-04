@@ -1644,7 +1644,7 @@ func TestEnsureAccessInNamespace_EmptyTargetNS(t *testing.T) {
 	}
 }
 
-func TestEnsureAccess_AllowAllRulesProducesEmptyRole(t *testing.T) {
+func TestEnsureAccess_DeferToStaticRBACProducesEmptyRole(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 
@@ -1656,7 +1656,7 @@ func TestEnsureAccess_AllowAllRulesProducesEmptyRole(t *testing.T) {
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
-		AllowAllRules(),
+		DeferToStaticRBAC(),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper failed: %v", err)
@@ -1686,7 +1686,7 @@ func TestEnsureAccess_AllowAllRulesProducesEmptyRole(t *testing.T) {
 	}
 
 	if len(role.Rules) != 0 {
-		t.Errorf("expected 0 rules with AllowAllRules (documents current behavior), got %d", len(role.Rules))
+		t.Errorf("expected 0 rules with DeferToStaticRBAC (documents current behavior), got %d", len(role.Rules))
 	}
 }
 

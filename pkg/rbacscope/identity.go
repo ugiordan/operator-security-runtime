@@ -18,7 +18,7 @@ type OperatorIdentity struct {
 
 // AllowedRules holds the set of PolicyRules that the RBACScoper is
 // allowed to grant. Use NewAllowedRules to create an instance with
-// explicit rules, or AllowAllRules to allow arbitrary per-call rules.
+// explicit rules, or DeferToStaticRBAC to bypass ceiling enforcement.
 type AllowedRules struct {
 	rules    []rbacv1.PolicyRule
 	allowAll bool
@@ -37,8 +37,12 @@ func NewAllowedRules(rules ...rbacv1.PolicyRule) (AllowedRules, error) {
 	return AllowedRules{rules: deepCopy}, nil
 }
 
-// AllowAllRules returns an AllowedRules that permits arbitrary rules.
-func AllowAllRules() AllowedRules {
+// DeferToStaticRBAC returns an AllowedRules that bypasses ceiling enforcement.
+// The scoper will still create Roles/ClusterRoles (for lifecycle tracking and
+// cleanup), but they will contain zero rules — granting no additional
+// permissions. Use this when the operator's static ClusterRole already
+// constrains access appropriately and dynamic rule scoping is not needed.
+func DeferToStaticRBAC() AllowedRules {
 	return AllowedRules{allowAll: true}
 }
 

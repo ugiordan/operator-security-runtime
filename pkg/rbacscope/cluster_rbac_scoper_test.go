@@ -641,11 +641,11 @@ func TestClusterScoper_EnsureAccess_ClusterRoleBindingDriftRecovery(t *testing.T
 	}
 }
 
-func TestClusterScoper_EnsureAccess_AllowAllRulesProducesEmptyClusterRole(t *testing.T) {
+func TestClusterScoper_EnsureAccess_DeferToStaticRBACProducesEmptyClusterRole(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
 
-	allowed := AllowAllRules()
+	allowed := DeferToStaticRBAC()
 	scoper, err := NewClusterRBACScoper(
 		cl,
 		OperatorIdentity{
@@ -666,7 +666,7 @@ func TestClusterScoper_EnsureAccess_AllowAllRulesProducesEmptyClusterRole(t *tes
 		t.Fatalf("EnsureAccess returned error: %v", err)
 	}
 
-	// Verify ClusterRole has zero rules when AllowAllRules is used
+	// Verify ClusterRole has zero rules when DeferToStaticRBAC is used
 	clusterRole := &rbacv1.ClusterRole{}
 	if err := cl.Get(ctx, types.NamespacedName{
 		Name: "test-operator-cluster-scoped-access",
@@ -675,7 +675,7 @@ func TestClusterScoper_EnsureAccess_AllowAllRulesProducesEmptyClusterRole(t *tes
 	}
 
 	if len(clusterRole.Rules) != 0 {
-		t.Errorf("expected 0 rules with AllowAllRules, got %d", len(clusterRole.Rules))
+		t.Errorf("expected 0 rules with DeferToStaticRBAC, got %d", len(clusterRole.Rules))
 	}
 }
 

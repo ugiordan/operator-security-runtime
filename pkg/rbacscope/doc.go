@@ -13,7 +13,7 @@
 // Both scopers support any combination of API groups, resources, and verbs via
 // AllowedRules, which accepts Kubernetes-native rbacv1.PolicyRule structs.
 // For operators whose static RBAC (via ClusterRole) already sufficiently constrains
-// access, AllowAllRules can be used as an explicit escape hatch that bypasses the
+// access, DeferToStaticRBAC can be used as an explicit escape hatch that bypasses the
 // ceiling enforcement.
 //
 // CleanupAccessInNamespace provides targeted cross-namespace cleanup for a single

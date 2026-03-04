@@ -45,7 +45,7 @@ func NewRBACScoper(
 		return nil, err
 	}
 	if allowed.allowAll {
-		ctrl.Log.Info("RBACScoper created with AllowAllRules - no ceiling enforcement",
+		ctrl.Log.Info("RBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
 	return &RBACScoper{

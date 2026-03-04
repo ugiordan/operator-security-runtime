@@ -45,7 +45,7 @@ func NewClusterRBACScoper(
 		return nil, err
 	}
 	if allowed.allowAll {
-		ctrl.Log.Info("ClusterRBACScoper created with AllowAllRules - no ceiling enforcement",
+		ctrl.Log.Info("ClusterRBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
 	return &ClusterRBACScoper{
