@@ -1,5 +1,7 @@
 package rbacscope
 
+import "fmt"
+
 // Option configures an RBACScoper.
 type Option interface {
 	apply(s *scopeConfig) // unexported - prevents external implementations
@@ -12,7 +14,8 @@ func (f optionFunc) apply(s *scopeConfig) { f(s) }
 // scopeConfig holds optional configuration for an RBACScoper.
 type scopeConfig struct {
 	deniedNamespaces         []string
-	deniedNamespacesModified bool // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
+	deniedNamespacesModified bool     // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
+	errs                     []error  // deferred validation errors from options
 }
 
 func defaultScopeConfig() scopeConfig {
@@ -45,11 +48,15 @@ func WithDeniedNamespaces(first string, rest ...string) Option {
 }
 
 // WithAdditionalDeniedNamespaces appends to the denied-namespace list without
-// removing the defaults.
+// removing the defaults. At least one namespace must be provided.
 // This option only applies to RBACScoper (namespace-scoped grants);
 // it has no effect on ClusterRBACScoper which manages cluster-scoped resources.
 func WithAdditionalDeniedNamespaces(namespaces ...string) Option {
 	return optionFunc(func(s *scopeConfig) {
+		if len(namespaces) == 0 {
+			s.errs = append(s.errs, fmt.Errorf("WithAdditionalDeniedNamespaces requires at least one namespace"))
+			return
+		}
 		s.deniedNamespaces = append(s.deniedNamespaces, namespaces...)
 		s.deniedNamespacesModified = true
 	})

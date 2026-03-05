@@ -201,6 +201,18 @@ func validateCoreInputs(
 		opt.apply(&cfg)
 	}
 
+	// Surface deferred errors from option functions.
+	if len(cfg.errs) > 0 {
+		return scopeConfig{}, nil, cfg.errs[0]
+	}
+
+	// Validate that no denied namespace entry is empty.
+	for _, ns := range cfg.deniedNamespaces {
+		if ns == "" {
+			return scopeConfig{}, nil, fmt.Errorf("denied namespace must not be empty")
+		}
+	}
+
 	var rules []rbacv1.PolicyRule
 	if !allowed.deferToStatic {
 		rules = make([]rbacv1.PolicyRule, len(allowed.rules))

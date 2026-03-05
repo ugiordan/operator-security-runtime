@@ -183,6 +183,18 @@ if err != nil {
 }
 ```
 
+If your operator's static ClusterRole already constrains access appropriately
+and you only need lifecycle tracking (ownership annotations, cleanup on CR
+deletion) without dynamic rule scoping, use `DeferToStaticRBAC()` instead of
+`NewAllowedRules`:
+
+```go
+allowed := rbacscope.DeferToStaticRBAC()
+```
+
+The scoper will still create Roles/ClusterRoles for ownership tracking, but
+they will contain zero rules, granting no additional permissions.
+
 Pass the scoper to your reconciler:
 
 ```go

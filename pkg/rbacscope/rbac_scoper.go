@@ -103,11 +103,11 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 	}
 
 	if err := s.ensureRoleWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
-		return fmt.Errorf("ensuring Role in namespace %s: %w", ns, err)
+		return fmt.Errorf("ensuring Role: %w", err)
 	}
 
 	if err := s.ensureRoleBindingWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
-		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", ns, err)
+		return fmt.Errorf("ensuring RoleBinding: %w", err)
 	}
 
 	return nil
@@ -373,11 +373,11 @@ func (s *RBACScoper) EnsureAccessInNamespace(
 	}
 
 	if err := s.ensureRoleWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
-		return fmt.Errorf("ensuring Role in namespace %s: %w", targetNS, err)
+		return fmt.Errorf("ensuring Role: %w", err)
 	}
 
 	if err := s.ensureRoleBindingWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
-		return fmt.Errorf("ensuring RoleBinding in namespace %s: %w", targetNS, err)
+		return fmt.Errorf("ensuring RoleBinding: %w", err)
 	}
 
 	return nil

@@ -944,6 +944,54 @@ func TestNewRBACScoper_WithOptions(t *testing.T) {
 	}
 }
 
+func TestNewRBACScoper_OptionValidation(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	identity := OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"}
+	allowed, _ := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"},
+	})
+
+	tests := []struct {
+		name   string
+		opts   []Option
+		errMsg string
+	}{
+		{
+			name:   "WithAdditionalDeniedNamespaces with zero args",
+			opts:   []Option{WithAdditionalDeniedNamespaces()},
+			errMsg: "WithAdditionalDeniedNamespaces requires at least one namespace",
+		},
+		{
+			name:   "WithDeniedNamespaces with empty string",
+			opts:   []Option{WithDeniedNamespaces("")},
+			errMsg: "denied namespace must not be empty",
+		},
+		{
+			name:   "WithAdditionalDeniedNamespaces with empty string",
+			opts:   []Option{WithAdditionalDeniedNamespaces("")},
+			errMsg: "denied namespace must not be empty",
+		},
+		{
+			name:   "WithDeniedNamespaces with valid first and empty rest",
+			opts:   []Option{WithDeniedNamespaces("valid", "")},
+			errMsg: "denied namespace must not be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRBACScoper(cl, s, identity, allowed, tt.opts...)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("expected error containing %q, got %q", tt.errMsg, err.Error())
+			}
+		})
+	}
+}
+
 func TestEnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
