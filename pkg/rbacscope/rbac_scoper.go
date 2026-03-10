@@ -17,6 +17,10 @@ import (
 // RBACScoper dynamically creates and deletes namespace-scoped Roles and
 // RoleBindings so that the operator ServiceAccount can access resources only
 // in namespaces where a CR exists.
+//
+// RBACScoper is safe for concurrent use by multiple goroutines. All fields
+// are immutable after construction; methods only read struct fields and make
+// Kubernetes API calls (which are themselves concurrency-safe).
 type RBACScoper struct {
 	client              client.Client
 	scheme              *runtime.Scheme
@@ -91,11 +95,21 @@ func (s *RBACScoper) labels() map[string]string {
 // Callers must ensure that CRD-level RBAC or admission policies prevent CR
 // creation in sensitive namespaces if that is undesirable.
 func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) error {
+	log := ctrl.LoggerFrom(ctx).WithName("RBACScoper")
 	ns := owner.GetNamespace()
 
 	if ns == "" {
 		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
+	}
+
+	// Warn when granting access in a well-known sensitive namespace.
+	// EnsureAccess intentionally does not block this (see comment above),
+	// but the warning helps operators catch unintended CR placement.
+	if s.isDeniedNamespace(ns) {
+		log.Info("WARNING: granting scoped access in a sensitive namespace — "+
+			"ensure CRD-level RBAC or admission policies prevent unintended CR creation here",
+			"namespace", ns, "owner", owner.GetName())
 	}
 
 	ownerRefFn := func(obj client.Object, o client.Object) error {

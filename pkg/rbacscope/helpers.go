@@ -57,6 +57,14 @@ const (
 // protection against other controllers, but is not needed currently because
 // managed resources use operator-specific names (<operator>-scoped-access)
 // that other controllers are unlikely to modify.
+//
+// Security note: any user with update access to Roles/ClusterRoles can modify
+// the ownership annotation, potentially adding fake owners (to prevent cleanup)
+// or removing legitimate owners (to trigger premature deletion). This is
+// mitigated by the fact that managed resources use operator-specific names
+// and modifying RBAC resources already requires elevated privileges. For
+// stricter protection, consider using a ValidatingWebhook that restricts
+// annotation modifications to the operator's ServiceAccount.
 type annotationOwnerTracker struct {
 	annotationKey string
 }

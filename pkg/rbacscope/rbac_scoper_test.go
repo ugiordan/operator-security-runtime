@@ -2801,3 +2801,67 @@ func TestAccessScoperInterface(t *testing.T) {
 	var _ AccessScoper = (*RBACScoper)(nil)
 	var _ AccessScoper = (*ClusterRBACScoper)(nil)
 }
+
+// TestConcurrentEnsureAccess verifies that multiple goroutines can call
+// EnsureAccess and CleanupAccess concurrently without data races.
+// Run with: go test -race -run TestConcurrentEnsureAccess
+func TestConcurrentEnsureAccess(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, cl)
+	ctx := context.Background()
+
+	const goroutines = 10
+	var errCount atomic.Int32
+
+	// Create owners in different namespaces
+	owners := make([]*testResource, goroutines)
+	for i := range owners {
+		owners[i] = &testResource{
+			TypeMeta: metav1.TypeMeta{APIVersion: "test.example.com/v1alpha1", Kind: "TestResource"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("cr-%d", i),
+				Namespace: fmt.Sprintf("ns-%d", i),
+				UID:       types.UID(fmt.Sprintf("uid-%d", i)),
+			},
+		}
+	}
+
+	// Concurrent EnsureAccess calls
+	done := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer func() { done <- struct{}{} }()
+			if err := scoper.EnsureAccess(ctx, owners[idx]); err != nil {
+				errCount.Add(1)
+				t.Logf("EnsureAccess goroutine %d error: %v", idx, err)
+			}
+		}(i)
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	if c := errCount.Load(); c > 0 {
+		t.Errorf("expected 0 errors from concurrent EnsureAccess, got %d", c)
+	}
+
+	// Concurrent CleanupAccess calls
+	errCount.Store(0)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer func() { done <- struct{}{} }()
+			if err := scoper.CleanupAccess(ctx, owners[idx]); err != nil {
+				errCount.Add(1)
+				t.Logf("CleanupAccess goroutine %d error: %v", idx, err)
+			}
+		}(i)
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	if c := errCount.Load(); c > 0 {
+		t.Errorf("expected 0 errors from concurrent CleanupAccess, got %d", c)
+	}
+}

@@ -18,6 +18,10 @@ import (
 // cluster-wide resources tied to CR lifecycle. Unlike RBACScoper, it uses
 // annotation-based ownership exclusively because ClusterRoles are
 // cluster-scoped and cannot have OwnerReferences pointing to namespaced resources.
+//
+// ClusterRBACScoper is safe for concurrent use by multiple goroutines. All
+// fields are immutable after construction; methods only read struct fields
+// and make Kubernetes API calls (which are themselves concurrency-safe).
 type ClusterRBACScoper struct {
 	client              client.Client
 	operatorName        string
