@@ -1008,21 +1008,24 @@ func TestEnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
 
+	// RBACScoper.EnsureAccess rejects cluster-scoped owners because it needs
+	// a namespace for the Role/RoleBinding. The error guides callers to use
+	// EnsureAccessInNamespace instead.
 	err := scoper.EnsureAccess(ctx, clusterCR)
 	if err == nil {
 		t.Fatal("expected error for cluster-scoped owner, got nil")
 	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	if !strings.Contains(err.Error(), "cluster-scoped") {
+		t.Errorf("expected error about cluster-scoped, got %q", err.Error())
 	}
 
-	// CleanupAccess should also reject
+	// CleanupAccess should also reject, guiding to CleanupAccessInNamespace
 	err = scoper.CleanupAccess(ctx, clusterCR)
 	if err == nil {
 		t.Fatal("expected error from CleanupAccess for cluster-scoped owner, got nil")
 	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("CleanupAccess: expected error about namespace-scoped, got %q", err.Error())
+	if !strings.Contains(err.Error(), "cluster-scoped") {
+		t.Errorf("CleanupAccess: expected error about cluster-scoped, got %q", err.Error())
 	}
 }
 
@@ -1300,6 +1303,36 @@ func TestEnsureAccessInNamespace_DeniedNamespace(t *testing.T) {
 
 	// Test non-denied namespace should succeed
 	err = scoper.EnsureAccessInNamespace(ctx, cr, "my-app-ns")
+	if err != nil {
+		t.Fatalf("expected non-denied namespace to succeed, got error: %v", err)
+	}
+}
+
+func TestEnsureAccessInNamespace_DeniedNamespace_ClusterScopedOwner(t *testing.T) {
+	s := testScheme()
+	builder := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, builder)
+	ctx := context.Background()
+
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-cr",
+			UID:  types.UID("cluster-uid"),
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	// Cluster-scoped owner targeting a denied namespace should be rejected
+	err := scoper.EnsureAccessInNamespace(ctx, clusterCR, "kube-system")
+	if err == nil {
+		t.Fatal("expected error for denied namespace kube-system with cluster-scoped owner, got nil")
+	}
+	if !strings.Contains(err.Error(), "denied") {
+		t.Errorf("expected error about denied namespace, got %q", err.Error())
+	}
+
+	// Non-denied namespace should succeed
+	err = scoper.EnsureAccessInNamespace(ctx, clusterCR, "my-app-ns")
 	if err != nil {
 		t.Fatalf("expected non-denied namespace to succeed, got error: %v", err)
 	}
@@ -1627,38 +1660,54 @@ func TestIsDeniedNamespace(t *testing.T) {
 	}
 }
 
-func TestEnsureAccessInNamespace_RejectsClusterScopedOwner(t *testing.T) {
+func TestEnsureAccessInNamespace_AcceptsClusterScopedOwner(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
 	scoper := newTestScoper(t, s, builder)
 	ctx := context.Background()
 
-	// Create a cluster-scoped resource (no namespace)
+	// Cluster-scoped owner
 	clusterCR := &testResource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cluster-scoped-cr",
 			UID:  types.UID("cluster-uid"),
-			// No Namespace -- cluster-scoped
 		},
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
 
-	// EnsureAccessInNamespace should reject cluster-scoped owners
-	err := scoper.EnsureAccessInNamespace(ctx, clusterCR, "some-target-ns")
-	if err == nil {
-		t.Fatal("expected error for cluster-scoped owner in EnsureAccessInNamespace, got nil")
-	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	// EnsureAccessInNamespace should accept cluster-scoped owners
+	// and use annotation-based ownership
+	if err := scoper.EnsureAccessInNamespace(ctx, clusterCR, "some-target-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace should accept cluster-scoped owner, got: %v", err)
 	}
 
-	// CleanupAllAccess should also reject cluster-scoped owners
-	err = scoper.CleanupAllAccess(ctx, clusterCR)
-	if err == nil {
-		t.Fatal("expected error from CleanupAllAccess for cluster-scoped owner, got nil")
+	// Verify Role was created with annotation-based ownership (not OwnerReferences)
+	role := &rbacv1.Role{}
+	if err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: scoper.roleName(), Namespace: "some-target-ns",
+	}, role); err != nil {
+		t.Fatalf("expected Role to exist: %v", err)
 	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("CleanupAllAccess: expected error about namespace-scoped, got %q", err.Error())
+	if len(role.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences (cluster-scoped owner), got %d", len(role.OwnerReferences))
+	}
+	annotation := role.GetAnnotations()[ownerAnnotationKey]
+	expectedKey := "/cluster-scoped-cr/cluster-uid"
+	if annotation != expectedKey {
+		t.Errorf("expected owner annotation %q, got %q", expectedKey, annotation)
+	}
+
+	// CleanupAllAccess should also accept cluster-scoped owners
+	if err := scoper.CleanupAllAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("CleanupAllAccess should accept cluster-scoped owner, got: %v", err)
+	}
+
+	// Verify Role was deleted
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: scoper.roleName(), Namespace: "some-target-ns",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted after CleanupAllAccess, got err=%v", err)
 	}
 }
 
@@ -2276,28 +2325,38 @@ func TestCleanupAccessInNamespace_EmptyTargetNS(t *testing.T) {
 	}
 }
 
-func TestCleanupAccessInNamespace_RejectsClusterScopedOwner(t *testing.T) {
+func TestCleanupAccessInNamespace_AcceptsClusterScopedOwner(t *testing.T) {
 	s := testScheme()
 	builder := fake.NewClientBuilder().WithScheme(s)
 	scoper := newTestScoper(t, s, builder)
 	ctx := context.Background()
 
-	// Create a cluster-scoped resource (no namespace)
+	// Cluster-scoped owner
 	clusterCR := &testResource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cluster-scoped-cr",
 			UID:  types.UID("cluster-uid"),
-			// No Namespace -- cluster-scoped
 		},
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
 
-	err := scoper.CleanupAccessInNamespace(ctx, clusterCR, "some-target-ns")
-	if err == nil {
-		t.Fatal("expected error for cluster-scoped owner in CleanupAccessInNamespace, got nil")
+	// First create access, then clean up
+	if err := scoper.EnsureAccessInNamespace(ctx, clusterCR, "some-target-ns"); err != nil {
+		t.Fatalf("EnsureAccessInNamespace failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+
+	// CleanupAccessInNamespace should accept cluster-scoped owners
+	if err := scoper.CleanupAccessInNamespace(ctx, clusterCR, "some-target-ns"); err != nil {
+		t.Fatalf("CleanupAccessInNamespace should accept cluster-scoped owner, got: %v", err)
+	}
+
+	// Verify Role was deleted
+	role := &rbacv1.Role{}
+	err := scoper.client.Get(ctx, types.NamespacedName{
+		Name: scoper.roleName(), Namespace: "some-target-ns",
+	}, role)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to be deleted, got err=%v", err)
 	}
 }
 

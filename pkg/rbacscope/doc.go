@@ -7,8 +7,11 @@
 // EnsureAccessInNamespace) use annotation-based ownership.
 //
 // ClusterRBACScoper provides the same lifecycle management for cluster-scoped
-// ClusterRoles and ClusterRoleBindings, using annotation-based ownership since
-// OwnerReferences cannot cross namespace boundaries to cluster scope.
+// ClusterRoles and ClusterRoleBindings. It accepts both namespace-scoped and
+// cluster-scoped owners. When constructed with WithScheme and the owner is
+// cluster-scoped, OwnerReferences are used (native K8s GC). For namespace-scoped
+// owners (or without WithScheme), annotation-based ownership is used since
+// Kubernetes rejects OwnerReferences from namespace-scoped to cluster-scoped.
 //
 // Both scopers support any combination of API groups, resources, and verbs via
 // AllowedRules, which accepts Kubernetes-native rbacv1.PolicyRule structs.
@@ -56,7 +59,7 @@
 //	if err := scoper.EnsureAccessInNamespace(ctx, cr, targetNS); err != nil { ... }
 //	if err := scoper.CleanupAllAccess(ctx, cr); err != nil { ... }
 //
-// Cluster-scoped usage:
+// Cluster-scoped usage (with OwnerReferences for cluster-scoped owners):
 //
 //	clusterScoper, err := rbacscope.NewClusterRBACScoper(
 //	    mgr.GetClient(),
@@ -66,9 +69,11 @@
 //	        Namespace:      "my-operator-system",
 //	    },
 //	    allowed,
+//	    rbacscope.WithScheme(mgr.GetScheme()), // enables OwnerReferences for cluster-scoped owners
 //	)
 //	if err != nil { ... }
 //
+//	// Works with both namespace-scoped and cluster-scoped owners:
 //	if err := clusterScoper.EnsureAccess(ctx, cr); err != nil { ... }
 //	if err := clusterScoper.CleanupAccess(ctx, cr); err != nil { ... }
 package rbacscope

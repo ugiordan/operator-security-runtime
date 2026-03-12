@@ -381,6 +381,15 @@ if err != nil {
     setupLog.Error(err, "unable to create cluster RBAC scoper")
     os.Exit(1)
 }
+
+// If your CR is cluster-scoped, pass WithScheme to enable Kubernetes-native
+// OwnerReferences and automatic garbage collection:
+clusterScoper, err := rbacscope.NewClusterRBACScoper(
+    mgr.GetClient(),
+    identity,
+    allowed,
+    rbacscope.WithScheme(mgr.GetScheme()),
+)
 ```
 
 In your reconciler:
@@ -397,9 +406,10 @@ if err := r.ClusterRBACScoper.CleanupAccess(ctx, cr); err != nil {
 }
 ```
 
-`ClusterRBACScoper` does not require a `*runtime.Scheme` parameter because
-it uses annotation-based ownership exclusively. Additional RBAC permissions
-are required:
+`ClusterRBACScoper` does not require a scheme by default. To enable
+OwnerReference-based ownership for cluster-scoped owners, pass
+`rbacscope.WithScheme(mgr.GetScheme())` as shown above. Both namespace-scoped
+and cluster-scoped owners are accepted. Additional RBAC permissions are required:
 
 ```go
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;delete;escalate
@@ -417,6 +427,8 @@ Provide an `OwnerResolver` callback that checks whether a given owner still
 exists. The library calls this for each annotation entry it finds:
 
 ```go
+// For cluster-scoped owners, ns is empty (""). The NamespacedName lookup
+// works correctly for both namespace-scoped and cluster-scoped resources.
 resolver := func(ctx context.Context, ns, name string, uid types.UID) (bool, error) {
     var cr yourv1.YourResource
     err := client.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cr)

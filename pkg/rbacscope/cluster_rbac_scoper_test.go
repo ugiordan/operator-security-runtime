@@ -9,6 +9,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -537,38 +538,166 @@ func TestClusterScoper_CleanupAccess_NoErrorWhenNotFound(t *testing.T) {
 	}
 }
 
-func TestClusterScoper_EnsureAccess_RejectsClusterScopedOwner(t *testing.T) {
+func TestClusterScoper_EnsureAccess_AcceptsClusterScopedOwner_WithAnnotations(t *testing.T) {
 	s := testScheme()
 	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	// No WithScheme — uses annotation-based ownership
 	scoper := newTestClusterScoper(t, cl)
 	ctx := context.Background()
 
-	// Create a cluster-scoped resource (no namespace)
 	clusterCR := &testResource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cluster-scoped-cr",
 			UID:  types.UID("cluster-uid"),
-			// No Namespace -- cluster-scoped
 		},
 	}
 	clusterCR.SetGroupVersionKind(testGVK)
 
-	// EnsureAccess should reject cluster-scoped owners
-	err := scoper.EnsureAccess(ctx, clusterCR)
-	if err == nil {
-		t.Fatal("expected error for cluster-scoped owner, got nil")
-	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("expected error about namespace-scoped, got %q", err.Error())
+	if err := scoper.EnsureAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("EnsureAccess should accept cluster-scoped owner, got: %v", err)
 	}
 
-	// CleanupAccess should also reject
-	err = scoper.CleanupAccess(ctx, clusterCR)
-	if err == nil {
-		t.Fatal("expected error from CleanupAccess for cluster-scoped owner, got nil")
+	// Verify annotation-based ownership (no OwnerReferences without WithScheme)
+	cr := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr); err != nil {
+		t.Fatalf("expected ClusterRole to exist: %v", err)
 	}
-	if !strings.Contains(err.Error(), "namespace-scoped") {
-		t.Errorf("CleanupAccess: expected error about namespace-scoped, got %q", err.Error())
+	if len(cr.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences without WithScheme, got %d", len(cr.OwnerReferences))
+	}
+	annotation := cr.GetAnnotations()[ownerAnnotationKey]
+	expectedKey := "/cluster-scoped-cr/cluster-uid"
+	if annotation != expectedKey {
+		t.Errorf("expected owner annotation %q, got %q", expectedKey, annotation)
+	}
+
+	// CleanupAccess should also work
+	if err := scoper.CleanupAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("CleanupAccess should accept cluster-scoped owner, got: %v", err)
+	}
+
+	err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole to be deleted, got err=%v", err)
+	}
+}
+
+func TestClusterScoper_EnsureAccess_ClusterScopedOwner_WithScheme_UsesOwnerReferences(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"nodes"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules failed: %v", err)
+	}
+
+	scoper, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+		WithScheme(s),
+	)
+	if err != nil {
+		t.Fatalf("NewClusterRBACScoper failed: %v", err)
+	}
+	ctx := context.Background()
+
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-scoped-cr",
+			UID:  types.UID("cluster-uid"),
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	if err := scoper.EnsureAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("EnsureAccess should accept cluster-scoped owner with WithScheme, got: %v", err)
+	}
+
+	// Verify OwnerReference-based ownership (cluster→cluster is allowed)
+	cr := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr); err != nil {
+		t.Fatalf("expected ClusterRole to exist: %v", err)
+	}
+	if len(cr.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 OwnerReference with WithScheme, got %d", len(cr.OwnerReferences))
+	}
+	if cr.OwnerReferences[0].Name != "cluster-scoped-cr" {
+		t.Errorf("expected OwnerReference Name = cluster-scoped-cr, got %q", cr.OwnerReferences[0].Name)
+	}
+
+	// Verify no annotation-based ownership (OwnerReferences are used instead)
+	annotation := cr.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "" {
+		t.Errorf("expected no owner annotation when using OwnerReferences, got %q", annotation)
+	}
+
+	// CleanupAccess should remove OwnerReference
+	if err := scoper.CleanupAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("CleanupAccess failed: %v", err)
+	}
+
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole to be deleted, got err=%v", err)
+	}
+}
+
+func TestClusterScoper_EnsureAccess_NamespaceScopedOwner_WithScheme_UsesAnnotations(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"nodes"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules failed: %v", err)
+	}
+
+	scoper, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+		WithScheme(s),
+	)
+	if err != nil {
+		t.Fatalf("NewClusterRBACScoper failed: %v", err)
+	}
+	ctx := context.Background()
+
+	// Namespace-scoped owner — even with WithScheme, K8s rejects
+	// OwnerReferences from namespace-scoped to cluster-scoped
+	nsCR := newTestCR()
+
+	if err := scoper.EnsureAccess(ctx, nsCR); err != nil {
+		t.Fatalf("EnsureAccess should accept namespace-scoped owner, got: %v", err)
+	}
+
+	// Verify annotation-based ownership (namespace→cluster cannot use OwnerReferences)
+	cr := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr); err != nil {
+		t.Fatalf("expected ClusterRole to exist: %v", err)
+	}
+	if len(cr.OwnerReferences) != 0 {
+		t.Errorf("expected no OwnerReferences for namespace-scoped owner, got %d", len(cr.OwnerReferences))
+	}
+	annotation := cr.GetAnnotations()[ownerAnnotationKey]
+	if annotation == "" {
+		t.Error("expected owner annotation for namespace-scoped owner, got empty")
 	}
 }
 
@@ -886,6 +1015,51 @@ func TestClusterGarbageCollectOrphanedOwners_RemovesMalformedEntries(t *testing.
 	}
 }
 
+func TestClusterGarbageCollectOrphanedOwners_ClusterScopedOwnerEntry(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Cluster-scoped owner produces annotation with empty namespace: "/name/uid"
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "/cluster-cr/cluster-uid,ns-a/ns-cr/ns-uid",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoper(t, cl)
+
+	// Only the namespace-scoped owner exists; cluster-scoped one is orphaned
+	resolver := newTestResolver(map[string]bool{
+		"ns-a/ns-cr/ns-uid": true,
+	})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+
+	gotCR := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR); err != nil {
+		t.Fatalf("expected ClusterRole to still exist: %v", err)
+	}
+	annotation := gotCR.GetAnnotations()[ownerAnnotationKey]
+	if annotation != "ns-a/ns-cr/ns-uid" {
+		t.Errorf("expected annotation to be %q, got %q", "ns-a/ns-cr/ns-uid", annotation)
+	}
+}
+
 func TestClusterGarbageCollectOrphanedOwners_NotFoundNoError(t *testing.T) {
 	s := testScheme()
 	ctx := context.Background()
@@ -908,5 +1082,223 @@ func TestClusterGarbageCollectOrphanedOwners_NotFoundNoError(t *testing.T) {
 	}
 	if result.ResourcesDeleted != 0 {
 		t.Errorf("expected 0 resources deleted, got %d", result.ResourcesDeleted)
+	}
+}
+
+func newTestClusterScoperWithScheme(t *testing.T, cl client.Client, s *runtime.Scheme) *ClusterRBACScoper {
+	t.Helper()
+	allowed, err := NewAllowedRules(rbacv1.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"nodes"},
+		Verbs:     []string{"get", "list", "watch"},
+	})
+	if err != nil {
+		t.Fatalf("NewAllowedRules failed: %v", err)
+	}
+	scoper, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test-operator",
+			ServiceAccount: "test-operator-sa",
+			Namespace:      "operator-system",
+		},
+		allowed,
+		WithScheme(s),
+	)
+	if err != nil {
+		t.Fatalf("NewClusterRBACScoper with WithScheme failed: %v", err)
+	}
+	return scoper
+}
+
+func TestClusterGC_WithScheme_PreservesResourceWithOwnerRefs(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// Pre-create a ClusterRole with both an OwnerReference and a stale annotation.
+	// GC should remove the stale annotation but NOT delete the resource because
+	// the OwnerReference is still present.
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "test.example.com/v1alpha1",
+				Kind:       "TestResource",
+				Name:       "valid-owner",
+				UID:        types.UID("valid-uid"),
+			}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoperWithScheme(t, cl, s)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 0 {
+		t.Errorf("expected 0 resources deleted (OwnerRef still present), got %d", result.ResourcesDeleted)
+	}
+
+	// Verify ClusterRole still exists
+	gotCR := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR); err != nil {
+		t.Fatalf("expected ClusterRole to still exist: %v", err)
+	}
+	if len(gotCR.OwnerReferences) != 1 {
+		t.Errorf("expected OwnerReference preserved, got %d", len(gotCR.OwnerReferences))
+	}
+}
+
+func TestClusterGC_WithScheme_DeletesWhenNoOwnerRefsRemain(t *testing.T) {
+	s := testScheme()
+	ctx := context.Background()
+
+	// ClusterRole with stale annotation AND no OwnerReferences.
+	// With WithScheme, GC checks both — should delete.
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-operator-cluster-scoped-access",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "test-operator",
+				"app.kubernetes.io/component":  "cluster-rbac-scoper",
+			},
+			Annotations: map[string]string{
+				ownerAnnotationKey: "gone-ns/gone-cr/gone-uid",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cr).Build()
+	scoper := newTestClusterScoperWithScheme(t, cl, s)
+
+	resolver := newTestResolver(map[string]bool{})
+
+	result, err := scoper.GarbageCollectOrphanedOwners(ctx, resolver)
+	if err != nil {
+		t.Fatalf("GarbageCollectOrphanedOwners returned error: %v", err)
+	}
+
+	if result.EntriesRemoved != 1 {
+		t.Errorf("expected 1 entry removed, got %d", result.EntriesRemoved)
+	}
+	if result.ResourcesDeleted != 1 {
+		t.Errorf("expected 1 resource deleted, got %d", result.ResourcesDeleted)
+	}
+
+	gotCR := &rbacv1.ClusterRole{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, gotCR)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole to be deleted, got err=%v", err)
+	}
+}
+
+func TestClusterScoper_MixedOwnership_WithScheme(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	scoper := newTestClusterScoperWithScheme(t, cl, s)
+	ctx := context.Background()
+
+	// Cluster-scoped owner (gets OwnerReference via WithScheme)
+	clusterCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-owner",
+			UID:  types.UID("cluster-owner-uid"),
+		},
+	}
+	clusterCR.SetGroupVersionKind(testGVK)
+
+	// Namespace-scoped owner (gets annotation even with WithScheme)
+	nsCR := &testResource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ns-owner",
+			Namespace: "ns-a",
+			UID:       types.UID("ns-owner-uid"),
+		},
+	}
+	nsCR.SetGroupVersionKind(testGVK)
+
+	// Both owners ensure access
+	if err := scoper.EnsureAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("EnsureAccess for cluster-scoped owner failed: %v", err)
+	}
+	if err := scoper.EnsureAccess(ctx, nsCR); err != nil {
+		t.Fatalf("EnsureAccess for namespace-scoped owner failed: %v", err)
+	}
+
+	// Verify both ownership mechanisms are present
+	cr := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr); err != nil {
+		t.Fatalf("expected ClusterRole to exist: %v", err)
+	}
+	if len(cr.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 OwnerReference from cluster-scoped owner, got %d", len(cr.OwnerReferences))
+	}
+	annotation := cr.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(annotation, "ns-a/ns-owner/ns-owner-uid") {
+		t.Errorf("expected annotation from namespace-scoped owner, got %q", annotation)
+	}
+
+	// Clean up cluster-scoped owner — resource should survive (ns-owner still present)
+	if err := scoper.CleanupAccess(ctx, clusterCR); err != nil {
+		t.Fatalf("CleanupAccess for cluster-scoped owner failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr); err != nil {
+		t.Fatal("ClusterRole was deleted when namespace-scoped owner still exists")
+	}
+	if len(cr.OwnerReferences) != 0 {
+		t.Errorf("expected OwnerReference removed, got %d", len(cr.OwnerReferences))
+	}
+	remainingAnnotation := cr.GetAnnotations()[ownerAnnotationKey]
+	if !strings.Contains(remainingAnnotation, "ns-a/ns-owner/ns-owner-uid") {
+		t.Errorf("expected ns-owner annotation preserved, got %q", remainingAnnotation)
+	}
+
+	// Clean up namespace-scoped owner — resource should be deleted
+	if err := scoper.CleanupAccess(ctx, nsCR); err != nil {
+		t.Fatalf("CleanupAccess for namespace-scoped owner failed: %v", err)
+	}
+
+	err := cl.Get(ctx, types.NamespacedName{Name: "test-operator-cluster-scoped-access"}, cr)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected ClusterRole deleted after all owners cleaned up, got err=%v", err)
+	}
+}
+
+func TestNewClusterRBACScoper_WithSchemeNil_ReturnsError(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s).Build()
+	validRules, _ := NewAllowedRules(rbacv1.PolicyRule{Verbs: []string{"get"}})
+
+	_, err := NewClusterRBACScoper(
+		cl,
+		OperatorIdentity{
+			Name:           "test",
+			ServiceAccount: "test-sa",
+			Namespace:      "test-ns",
+		},
+		validRules,
+		WithScheme(nil),
+	)
+	if err == nil {
+		t.Fatal("expected error for WithScheme(nil), got nil")
+	}
+	if !strings.Contains(err.Error(), "WithScheme requires a non-nil scheme") {
+		t.Errorf("expected error about non-nil scheme, got %q", err.Error())
 	}
 }

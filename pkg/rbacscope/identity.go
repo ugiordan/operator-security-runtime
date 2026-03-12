@@ -58,12 +58,24 @@ func DeferToStaticRBAC() AllowedRules {
 // CleanupAllAccess) are not part of this interface. Use the concrete type when
 // cross-namespace operations are needed.
 //
-// RBACScoper manages namespace-scoped Roles/RoleBindings.
+// RBACScoper manages namespace-scoped Roles/RoleBindings. Its EnsureAccess
+// requires a namespace-scoped owner (use EnsureAccessInNamespace for
+// cluster-scoped owners that need access in a specific namespace).
+//
 // ClusterRBACScoper manages cluster-scoped ClusterRoles/ClusterRoleBindings.
+// It accepts both namespace-scoped and cluster-scoped owners. When
+// constructed with WithScheme and the owner is cluster-scoped,
+// OwnerReferences are used (native K8s GC). Otherwise, annotation-based
+// ownership is used.
+//
 // Both follow the same ensure/cleanup lifecycle pattern.
 type AccessScoper interface {
-	// EnsureAccess creates or updates scoped RBAC resources for the given
-	// owner. The owner must be namespace-scoped.
+	// EnsureAccess creates or updates scoped RBAC resources for the given owner.
+	//
+	// For RBACScoper: owner must be namespace-scoped (the Role/RoleBinding
+	// is created in the owner's namespace).
+	// For ClusterRBACScoper: both namespace-scoped and cluster-scoped owners
+	// are accepted.
 	EnsureAccess(ctx context.Context, owner client.Object) error
 
 	// CleanupAccess removes the owner from scoped RBAC resources.

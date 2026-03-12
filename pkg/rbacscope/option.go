@@ -1,8 +1,12 @@
 package rbacscope
 
-import "fmt"
+import (
+	"fmt"
 
-// Option configures an RBACScoper.
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// Option configures an RBACScoper or ClusterRBACScoper.
 type Option interface {
 	apply(s *scopeConfig) // unexported - prevents external implementations
 }
@@ -13,9 +17,10 @@ func (f optionFunc) apply(s *scopeConfig) { f(s) }
 
 // scopeConfig holds optional configuration for an RBACScoper.
 type scopeConfig struct {
+	scheme                   *runtime.Scheme
 	deniedNamespaces         []string
-	deniedNamespacesModified bool     // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
-	errs                     []error  // deferred validation errors from options
+	deniedNamespacesModified bool    // set by WithDeniedNamespaces/WithAdditionalDeniedNamespaces
+	errs                     []error // deferred validation errors from options
 }
 
 func defaultScopeConfig() scopeConfig {
@@ -59,5 +64,27 @@ func WithAdditionalDeniedNamespaces(namespaces ...string) Option {
 		}
 		s.deniedNamespaces = append(s.deniedNamespaces, namespaces...)
 		s.deniedNamespacesModified = true
+	})
+}
+
+// WithScheme enables OwnerReference-based ownership for ClusterRBACScoper
+// when the owner is cluster-scoped (cluster-scoped owner → cluster-scoped
+// ClusterRole/ClusterRoleBinding). Without this option, ClusterRBACScoper
+// uses annotation-based ownership for all owners.
+//
+// The scheme is required because controllerutil.SetOwnerReference needs it
+// to look up the owner's GVK. When both the owner and owned resource are
+// cluster-scoped, Kubernetes allows native OwnerReferences, providing
+// automatic garbage collection and API-server-validated ownership.
+//
+// This option has no effect on RBACScoper (which manages namespace-scoped
+// resources where cluster-scoped owners cannot use OwnerReferences).
+func WithScheme(scheme *runtime.Scheme) Option {
+	return optionFunc(func(s *scopeConfig) {
+		if scheme == nil {
+			s.errs = append(s.errs, fmt.Errorf("WithScheme requires a non-nil scheme"))
+			return
+		}
+		s.scheme = scheme
 	})
 }

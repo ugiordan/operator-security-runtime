@@ -36,8 +36,8 @@ type RBACScoper struct {
 // validated up front; if any are invalid the constructor returns an error.
 // The scheme parameter is required because RBACScoper uses OwnerReferences
 // for same-namespace resources, and SetOwnerReference needs the scheme to
-// look up the owner's GVK. ClusterRBACScoper does not need scheme because
-// it uses annotation-based ownership exclusively.
+// look up the owner's GVK. ClusterRBACScoper does not require scheme by
+// default; pass WithScheme to enable OwnerReferences for cluster-scoped owners.
 func NewRBACScoper(
 	cl client.Client,
 	scheme *runtime.Scheme,
@@ -55,6 +55,10 @@ func NewRBACScoper(
 	if allowed.deferToStatic {
 		ctrl.Log.Info("RBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
+	}
+	if cfg.scheme != nil {
+		ctrl.Log.Info("RBACScoper: WithScheme option has no effect — scheme is always "+
+			"provided as a required parameter", "operatorName", identity.Name)
 	}
 	return &RBACScoper{
 		client:              cl,
@@ -99,7 +103,7 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 	ns := owner.GetNamespace()
 
 	if ns == "" {
-		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
+		return fmt.Errorf("owner is cluster-scoped (%s/%s); use EnsureAccessInNamespace to specify the target namespace",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
@@ -112,8 +116,8 @@ func (s *RBACScoper) EnsureAccess(ctx context.Context, owner client.Object) erro
 			"namespace", ns, "owner", owner.GetName())
 	}
 
-	ownerRefFn := func(obj client.Object, o client.Object) error {
-		return controllerutil.SetOwnerReference(o, obj, s.scheme)
+	ownerRefFn := func(controlled client.Object, owner client.Object) error {
+		return controllerutil.SetOwnerReference(owner, controlled, s.scheme)
 	}
 
 	if err := s.ensureRoleWithOwnership(ctx, owner, ns, ownerRefFn); err != nil {
@@ -189,30 +193,37 @@ func (s *RBACScoper) ensureRoleBindingWithOwnership(
 		return setOwnership(rb, owner)
 	}
 	result, err := controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
-	if err != nil {
-		// Handle RoleRef immutability: if someone changed RoleRef externally,
-		// delete and recreate the RoleBinding.
-		if apierrors.IsInvalid(err) {
-			log.Info("RoleBinding has drifted RoleRef, recreating", "namespace", ns)
-			if delErr := s.client.Delete(ctx, rb); delErr != nil && !apierrors.IsNotFound(delErr) {
-				return fmt.Errorf("deleting stale RoleBinding %s/%s: %w", ns, s.roleBindingName(), delErr)
-			}
-			// Reset rb for recreation; mutateFn captures rb by pointer
-			// so it will populate the new object correctly.
-			rb = &rbacv1.RoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      s.roleBindingName(),
-					Namespace: ns,
-				},
-			}
-			result, err = controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
-			if err != nil {
-				return fmt.Errorf("recreating RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
-			}
-		} else {
-			return fmt.Errorf("reconciling RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
-		}
+	if err == nil {
+		log.Info("scoped RoleBinding reconciled", "namespace", ns, "rolebinding", s.roleBindingName(), "result", result)
+		return nil
 	}
+
+	// Handle RoleRef immutability: if someone changed RoleRef externally,
+	// delete and recreate the RoleBinding.
+	if !apierrors.IsInvalid(err) {
+		return fmt.Errorf("reconciling RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
+	}
+
+	log.Info("RoleBinding has drifted RoleRef, recreating", "namespace", ns)
+
+	if delErr := s.client.Delete(ctx, rb); delErr != nil && !apierrors.IsNotFound(delErr) {
+		return fmt.Errorf("deleting stale RoleBinding %s/%s: %w", ns, s.roleBindingName(), delErr)
+	}
+
+	// Reset rb for recreation; mutateFn captures rb by pointer
+	// so it will populate the new object correctly.
+	rb = &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      s.roleBindingName(),
+			Namespace: ns,
+		},
+	}
+
+	result, err = controllerutil.CreateOrUpdate(ctx, s.client, rb, mutateFn)
+	if err != nil {
+		return fmt.Errorf("recreating RoleBinding %s/%s: %w", ns, s.roleBindingName(), err)
+	}
+
 	log.Info("scoped RoleBinding reconciled", "namespace", ns, "rolebinding", s.roleBindingName(), "result", result)
 	return nil
 }
@@ -225,7 +236,7 @@ func (s *RBACScoper) CleanupAccess(ctx context.Context, owner client.Object) err
 	ns := owner.GetNamespace()
 
 	if ns == "" {
-		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
+		return fmt.Errorf("owner is cluster-scoped (%s/%s); use CleanupAccessInNamespace or CleanupAllAccess",
 			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
 	}
 
@@ -299,28 +310,27 @@ func removeOwnerRef(obj client.Object, owner client.Object) {
 }
 
 // CleanupAccessInNamespace removes the owner's references from the Role
-// and RoleBinding in targetNS. If targetNS equals the owner's namespace,
-// delegates to CleanupAccess (OwnerReference-based). Otherwise, uses
-// annotation-based ownership removal. Deletes resources if no owners remain.
+// and RoleBinding in targetNS. For namespace-scoped owners where targetNS
+// equals the owner's namespace, delegates to CleanupAccess (OwnerReference-based).
+// Otherwise, uses annotation-based ownership removal. Deletes resources if
+// no owners remain.
+//
+// Both namespace-scoped and cluster-scoped owners are accepted.
 func (s *RBACScoper) CleanupAccessInNamespace(
 	ctx context.Context,
 	owner client.Object,
 	targetNS string,
 ) error {
-	if owner.GetNamespace() == "" {
-		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
-			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
-	}
 	if targetNS == "" {
 		return fmt.Errorf("targetNS must not be empty")
 	}
 
-	// Same-namespace: delegate to CleanupAccess (OwnerReference-based)
-	if targetNS == owner.GetNamespace() {
+	// Same-namespace delegation only for namespace-scoped owners.
+	if owner.GetNamespace() != "" && targetNS == owner.GetNamespace() {
 		return s.CleanupAccess(ctx, owner)
 	}
 
-	// Cross-namespace: use Get-based cleanup with annotation ownership
+	// Cross-namespace or cluster-scoped owner: annotation-based cleanup
 	roleKey := types.NamespacedName{Name: s.roleName(), Namespace: targetNS}
 	role := &rbacv1.Role{}
 	if err := s.cleanupCrossNSResource(ctx, role, roleKey, owner, "Role"); err != nil {
@@ -354,27 +364,25 @@ func (s *RBACScoper) cleanupCrossNSResource(
 // EnsureAccessInNamespace creates/updates a Role and RoleBinding in
 // targetNS for the owner. Uses annotation-based ownership because
 // cross-namespace OwnerReferences are not supported by Kubernetes.
-// If targetNS is the same as the owner's namespace, this delegates
-// to EnsureAccess (which uses OwnerReferences).
+//
+// Both namespace-scoped and cluster-scoped owners are accepted.
+// For namespace-scoped owners where targetNS equals the owner's namespace,
+// this delegates to EnsureAccess (which uses OwnerReferences).
+// Cluster-scoped owners always use annotation-based ownership because
+// Kubernetes rejects OwnerReferences from cluster-scoped to namespace-scoped.
 func (s *RBACScoper) EnsureAccessInNamespace(
 	ctx context.Context,
 	owner client.Object,
 	targetNS string,
 ) error {
-	if owner.GetNamespace() == "" {
-		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
-			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
-	}
-
 	if targetNS == "" {
 		return fmt.Errorf("targetNS must not be empty")
 	}
 
-	// If targetNS is the owner's namespace, delegate to EnsureAccess (uses OwnerReferences).
-	// This must be checked before the denied namespace check so that
-	// EnsureAccessInNamespace(ctx, cr, cr.GetNamespace()) behaves identically
-	// to EnsureAccess(ctx, cr), including not rejecting the owner's own namespace.
-	if targetNS == owner.GetNamespace() {
+	// For namespace-scoped owners in their own namespace, delegate to
+	// EnsureAccess (uses OwnerReferences). Cluster-scoped owners (namespace=="")
+	// never match this condition, so they always use annotations below.
+	if owner.GetNamespace() != "" && targetNS == owner.GetNamespace() {
 		return s.EnsureAccess(ctx, owner)
 	}
 
@@ -382,8 +390,8 @@ func (s *RBACScoper) EnsureAccessInNamespace(
 		return fmt.Errorf("namespace %q is denied by configuration", targetNS)
 	}
 
-	annotationFn := func(obj client.Object, o client.Object) error {
-		return s.ownerTracker.addOwner(obj, o)
+	annotationFn := func(controlled client.Object, owner client.Object) error {
+		return s.ownerTracker.addOwner(controlled, owner)
 	}
 
 	if err := s.ensureRoleWithOwnership(ctx, owner, targetNS, annotationFn); err != nil {
@@ -440,16 +448,11 @@ func (s *RBACScoper) GarbageCollectOrphanedOwners(
 
 // CleanupAllAccess removes the owner's references from all managed
 // Roles and RoleBindings across namespaces. Uses label-selected listing
-// to find managed resources. For same-namespace resources, removes
-// OwnerReferences. For cross-namespace resources, removes annotation entries.
-// Resources with no remaining owners (no OwnerReferences AND no annotation
-// entries) are deleted.
+// to find managed resources. Removes both OwnerReferences and annotation
+// entries. Resources with no remaining owners are deleted.
+//
+// Both namespace-scoped and cluster-scoped owners are accepted.
 func (s *RBACScoper) CleanupAllAccess(ctx context.Context, owner client.Object) error {
-	if owner.GetNamespace() == "" {
-		return fmt.Errorf("owner must be namespace-scoped; got cluster-scoped resource %s/%s",
-			owner.GetObjectKind().GroupVersionKind(), owner.GetName())
-	}
-
 	cleanupFn := func(ctx context.Context, obj client.Object, kind string) error {
 		return s.cleanupManagedResource(ctx, obj, owner, &s.ownerTracker, kind)
 	}

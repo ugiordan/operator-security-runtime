@@ -431,7 +431,20 @@ flowchart TD
     style H fill:#e8f5e9,stroke:#4CAF50
 ```
 
-`ClusterRBACScoper` does not take a `*runtime.Scheme` parameter because it never uses OwnerReferences. It shares the `OperatorIdentity`, `AllowedRules`, and `Option` types with `RBACScoper`. The `WithDeniedNamespaces` option has no effect on `ClusterRBACScoper` since ClusterRoles are not namespace-bound.
+`ClusterRBACScoper` does not require a scheme by default. When constructed with `WithScheme`, it uses OwnerReferences for cluster-scoped owners (both owner and owned resource are cluster-scoped, so Kubernetes allows native OwnerReferences and automatic garbage collection). For namespace-scoped owners (or without `WithScheme`), annotation-based ownership is used since Kubernetes rejects OwnerReferences from namespace-scoped to cluster-scoped resources.
+
+It shares the `OperatorIdentity`, `AllowedRules`, and `Option` types with `RBACScoper`. The `WithDeniedNamespaces` option has no effect on `ClusterRBACScoper` since ClusterRoles are not namespace-bound.
+
+**Ownership strategy matrix:**
+
+| Owner Scope | Managed Resource Scope | WithScheme? | Ownership Mechanism |
+|---|---|---|---|
+| Namespace-scoped | Namespace (same NS) | N/A | OwnerReferences |
+| Namespace-scoped | Namespace (cross NS) | N/A | Annotations |
+| Namespace-scoped | Cluster | Any | Annotations |
+| Cluster-scoped | Cluster | Yes | OwnerReferences |
+| Cluster-scoped | Cluster | No | Annotations |
+| Cluster-scoped | Namespace | N/A | Annotations |
 
 Additional RBAC permissions required for cluster-scoped grants:
 

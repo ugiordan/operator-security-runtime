@@ -270,6 +270,8 @@ clusterScoper, err := rbacscope.NewClusterRBACScoper(
         Namespace:      "my-operator-system",
     },
     allowed,
+    // Optional: enables OwnerReferences for cluster-scoped owners (native K8s GC)
+    rbacscope.WithScheme(mgr.GetScheme()),
 )
 if err != nil { ... }
 

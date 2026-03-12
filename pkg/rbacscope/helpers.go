@@ -69,7 +69,9 @@ type annotationOwnerTracker struct {
 	annotationKey string
 }
 
-// ownerKey returns a string key for the given owner: "<namespace>/<name>/<uid>"
+// ownerKey returns a string key for the given owner: "<namespace>/<name>/<uid>".
+// For cluster-scoped owners (namespace=""), the key is "/<name>/<uid>".
+// This format is unambiguous because Kubernetes resource names cannot contain "/".
 func ownerKey(owner client.Object) string {
 	return fmt.Sprintf("%s/%s/%s", owner.GetNamespace(), owner.GetName(), string(owner.GetUID()))
 }
@@ -256,6 +258,9 @@ func (s *RBACScoper) isDeniedNamespace(ns string) bool {
 // exists. Returns true if the owner is still valid, false if it should be
 // considered orphaned. The resolver is a function type to keep the library
 // independent of specific CR types — callers provide the resolution logic.
+//
+// For cluster-scoped owners, namespace is empty (""). Implementations must
+// handle this case, e.g. by using a cluster-scoped Get when namespace is empty.
 type OwnerResolver func(ctx context.Context, namespace, name string, uid types.UID) (exists bool, err error)
 
 // GCResult contains the results of a garbage collection run.
@@ -283,10 +288,16 @@ func gcSplitAnnotationEntries(value string) []string {
 }
 
 // gcParseOwnerEntry parses a single annotation entry in "namespace/name/uid"
-// format. Returns nil if the entry is malformed (not exactly 3 parts).
+// format. For cluster-scoped owners, namespace is empty (entry starts with "/").
+// Returns nil if the entry is malformed (not exactly 3 parts, or empty name/uid).
+// Namespace may be empty (cluster-scoped owner), but name and uid must not be.
 func gcParseOwnerEntry(entry string) []string {
 	parts := strings.SplitN(entry, "/", 3)
 	if len(parts) != 3 {
+		return nil
+	}
+	// Name and UID must not be empty (namespace may be empty for cluster-scoped owners)
+	if parts[1] == "" || parts[2] == "" {
 		return nil
 	}
 	return parts
@@ -301,9 +312,11 @@ func gcJoinAnnotationEntries(entries []string) string {
 // gcAnnotationOwnersShared is the shared GC logic for both RBACScoper and
 // ClusterRBACScoper. It parses annotation owner entries, resolves each via
 // the resolver, removes stale or malformed entries, and deletes the resource
-// if no owners remain. When checkOwnerRefs is true (namespace-scoped), both
-// OwnerReferences and annotation entries must be empty before deletion.
-// When false (cluster-scoped), only annotation entries are checked.
+// if no owners remain. When checkOwnerRefs is true, both OwnerReferences and
+// annotation entries must be empty before deletion. When false, only
+// annotation entries are checked. RBACScoper always passes true (same-namespace
+// resources may have OwnerReferences). ClusterRBACScoper passes true only when
+// WithScheme was configured (cluster-scoped owners use OwnerReferences).
 func gcAnnotationOwnersShared(
 	ctx context.Context,
 	cl client.Client,
