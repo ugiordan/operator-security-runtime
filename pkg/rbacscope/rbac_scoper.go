@@ -34,35 +34,32 @@ type RBACScoper struct {
 
 // NewRBACScoper creates a validated RBACScoper. All required parameters are
 // validated up front; if any are invalid the constructor returns an error.
-// The scheme parameter is required because RBACScoper uses OwnerReferences
-// for same-namespace resources, and SetOwnerReference needs the scheme to
-// look up the owner's GVK. ClusterRBACScoper does not require scheme by
-// default; pass WithScheme to enable OwnerReferences for cluster-scoped owners.
+//
+// WithScheme is required because RBACScoper uses OwnerReferences for
+// same-namespace resources, and SetOwnerReference needs the scheme to look up
+// the owner's GVK. For ClusterRBACScoper, WithScheme is optional — it enables
+// OwnerReferences for cluster-scoped owners but is not needed for
+// annotation-based ownership.
 func NewRBACScoper(
 	cl client.Client,
-	scheme *runtime.Scheme,
 	identity OperatorIdentity,
 	allowed AllowedRules,
 	opts ...Option,
 ) (*RBACScoper, error) {
-	if scheme == nil {
-		return nil, fmt.Errorf("scheme must not be nil")
-	}
 	cfg, rules, err := validateCoreInputs(cl, identity, allowed, opts)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.scheme == nil {
+		return nil, fmt.Errorf("WithScheme is required for RBACScoper (needed for same-namespace OwnerReferences)")
 	}
 	if allowed.deferToStatic {
 		ctrl.Log.Info("RBACScoper created with DeferToStaticRBAC - no ceiling enforcement",
 			"operatorName", identity.Name)
 	}
-	if cfg.scheme != nil {
-		ctrl.Log.Info("RBACScoper: WithScheme option has no effect — scheme is always "+
-			"provided as a required parameter", "operatorName", identity.Name)
-	}
 	return &RBACScoper{
 		client:              cl,
-		scheme:              scheme,
+		scheme:              cfg.scheme,
 		operatorName:        identity.Name,
 		operatorSAName:      identity.ServiceAccount,
 		operatorSANamespace: identity.Namespace,

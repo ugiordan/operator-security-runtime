@@ -42,13 +42,13 @@ func newTestRBACScoper(t *testing.T, cl client.Client, s *runtime.Scheme) *rbacs
 	}
 	scoper, err := rbacscope.NewRBACScoper(
 		cl,
-		s,
 		rbacscope.OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-sa",
 			Namespace:      "operator-ns",
 		},
 		allowed,
+		rbacscope.WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper returned error: %v", err)

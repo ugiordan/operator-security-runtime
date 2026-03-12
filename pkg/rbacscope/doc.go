@@ -41,13 +41,13 @@
 //
 //	scoper, err := rbacscope.NewRBACScoper(
 //	    mgr.GetClient(),
-//	    mgr.GetScheme(),
 //	    rbacscope.OperatorIdentity{
 //	        Name:           "my-operator",
 //	        ServiceAccount: "my-operator-controller-manager",
 //	        Namespace:      "my-operator-system",
 //	    },
 //	    allowed,
+//	    rbacscope.WithScheme(mgr.GetScheme()),
 //	)
 //	if err != nil { ... }
 //

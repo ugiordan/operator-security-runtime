@@ -149,13 +149,13 @@ func main() {
 
 	rbacScoper, err := rbacscope.NewRBACScoper(
 		mgr.GetClient(),
-		mgr.GetScheme(),
 		rbacscope.OperatorIdentity{
 			Name:           operatorName,
 			ServiceAccount: operatorSA,
 			Namespace:      operatorNS,
 		},
 		allowed,
+		rbacscope.WithScheme(mgr.GetScheme()),
 	)
 	if err != nil {
 		setupLog.Error(err, "unable to create RBAC scoper")

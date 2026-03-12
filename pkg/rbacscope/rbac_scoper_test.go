@@ -59,13 +59,13 @@ func newTestScoper(t *testing.T, s *runtime.Scheme, cl *fake.ClientBuilder) *RBA
 	}
 	scoper, err := NewRBACScoper(
 		cl.Build(),
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		allowed,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper failed: %v", err)
@@ -262,13 +262,13 @@ func TestEnsureAccess_CustomRules(t *testing.T) {
 
 	scoper, err := NewRBACScoper(
 		builder.Build(),
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		allowed,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper returned error: %v", err)
@@ -451,13 +451,13 @@ func TestEnsureAccess_MultiResourceRules(t *testing.T) {
 
 	scoper, err := NewRBACScoper(
 		builder.Build(),
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		allowed,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper returned error: %v", err)
@@ -543,13 +543,13 @@ func TestEnsureAccess_RuleUpdateConvergence(t *testing.T) {
 
 	scoper1, err := NewRBACScoper(
 		cl,
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		allowed1,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper returned error: %v", err)
@@ -592,13 +592,13 @@ func TestEnsureAccess_RuleUpdateConvergence(t *testing.T) {
 
 	scoper2, err := NewRBACScoper(
 		cl,
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		allowed2,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper returned error: %v", err)
@@ -632,88 +632,88 @@ func TestNewRBACScoper_ValidationErrors(t *testing.T) {
 	tests := []struct {
 		name     string
 		cl       client.Client
-		scheme   *runtime.Scheme
 		identity OperatorIdentity
 		allowed  AllowedRules
+		opts     []Option
 		errMsg   string
 	}{
 		{
-			name:   "nil client",
-			cl:     nil,
-			scheme: s,
+			name: "nil client",
+			cl:   nil,
 			identity: OperatorIdentity{
 				Name:           "test",
 				ServiceAccount: "test-sa",
 				Namespace:      "test-ns",
 			},
 			allowed: validRules,
+			opts:    []Option{WithScheme(s)},
 			errMsg:  "client must not be nil",
 		},
 		{
-			name:   "nil scheme",
-			cl:     cl,
-			scheme: nil,
+			name: "no scheme",
+			cl:   cl,
 			identity: OperatorIdentity{
 				Name:           "test",
 				ServiceAccount: "test-sa",
 				Namespace:      "test-ns",
 			},
 			allowed: validRules,
-			errMsg:  "scheme must not be nil",
+			opts:    nil,
+			errMsg:  "WithScheme is required for RBACScoper",
 		},
 		{
-			name:   "empty Name",
-			cl:     cl,
-			scheme: s,
+			name: "empty Name",
+			cl:   cl,
 			identity: OperatorIdentity{
 				Name:           "",
 				ServiceAccount: "test-sa",
 				Namespace:      "test-ns",
 			},
 			allowed: validRules,
+			opts:    []Option{WithScheme(s)},
 			errMsg:  "OperatorIdentity.Name must not be empty",
 		},
 		{
-			name:   "empty ServiceAccount",
-			cl:     cl,
-			scheme: s,
+			name: "empty ServiceAccount",
+			cl:   cl,
 			identity: OperatorIdentity{
 				Name:           "test",
 				ServiceAccount: "",
 				Namespace:      "test-ns",
 			},
 			allowed: validRules,
+			opts:    []Option{WithScheme(s)},
 			errMsg:  "OperatorIdentity.ServiceAccount must not be empty",
 		},
 		{
-			name:   "empty Namespace",
-			cl:     cl,
-			scheme: s,
+			name: "empty Namespace",
+			cl:   cl,
 			identity: OperatorIdentity{
 				Name:           "test",
 				ServiceAccount: "test-sa",
 				Namespace:      "",
 			},
 			allowed: validRules,
+			opts:    []Option{WithScheme(s)},
 			errMsg:  "OperatorIdentity.Namespace must not be empty",
 		},
 		{
-			name:   "empty AllowedRules",
-			cl:     cl,
-			scheme: s,
+			name: "empty AllowedRules",
+			cl:   cl,
 			identity: OperatorIdentity{
 				Name:           "test",
 				ServiceAccount: "test-sa",
 				Namespace:      "test-ns",
 			},
 			allowed: AllowedRules{}, // zero-value: no rules and deferToStatic=false
+			opts:    []Option{WithScheme(s)},
 			errMsg:  "AllowedRules must not be empty",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewRBACScoper(tt.cl, tt.scheme, tt.identity, tt.allowed)
+			_, err := NewRBACScoper(tt.cl, tt.identity, tt.allowed, tt.opts...)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -879,7 +879,7 @@ func TestNewRBACScoper_DNS1123Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewRBACScoper(cl, s, tt.identity, validRules)
+			_, err := NewRBACScoper(cl, tt.identity, validRules, WithScheme(s))
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -931,9 +931,10 @@ func TestNewRBACScoper_WithOptions(t *testing.T) {
 		APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"},
 	})
 
-	scoper, err := NewRBACScoper(cl, s,
+	scoper, err := NewRBACScoper(cl,
 		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
 		allowed,
+		WithScheme(s),
 		WithDeniedNamespaces("custom-ns"),
 	)
 	if err != nil {
@@ -981,7 +982,7 @@ func TestNewRBACScoper_OptionValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewRBACScoper(cl, s, identity, allowed, tt.opts...)
+			_, err := NewRBACScoper(cl, identity, allowed, append([]Option{WithScheme(s)}, tt.opts...)...)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -1570,9 +1571,10 @@ func TestIsDeniedNamespace(t *testing.T) {
 	})
 
 	// Default denied list includes: kube-system, kube-public, kube-node-lease, default, openshift-
-	scoper, err := NewRBACScoper(cl, s,
+	scoper, err := NewRBACScoper(cl,
 		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
 		allowed,
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1611,9 +1613,10 @@ func TestIsDeniedNamespace(t *testing.T) {
 	}
 
 	// Test with custom denied namespaces
-	scoper2, err := NewRBACScoper(cl, s,
+	scoper2, err := NewRBACScoper(cl,
 		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
 		allowed,
+		WithScheme(s),
 		WithDeniedNamespaces("custom-ns", "prefix-"),
 	)
 	if err != nil {
@@ -1631,9 +1634,10 @@ func TestIsDeniedNamespace(t *testing.T) {
 	}
 
 	// Test WithAdditionalDeniedNamespaces: appends without removing defaults
-	scoper3, err := NewRBACScoper(cl, s,
+	scoper3, err := NewRBACScoper(cl,
 		OperatorIdentity{Name: "op", ServiceAccount: "sa", Namespace: "ns"},
 		allowed,
+		WithScheme(s),
 		WithAdditionalDeniedNamespaces("extra-ns", "team-"),
 	)
 	if err != nil {
@@ -1782,13 +1786,13 @@ func TestEnsureAccess_DeferToStaticRBACProducesEmptyRole(t *testing.T) {
 
 	scoper, err := NewRBACScoper(
 		cl,
-		s,
 		OperatorIdentity{
 			Name:           "test-operator",
 			ServiceAccount: "test-operator-sa",
 			Namespace:      "operator-system",
 		},
 		DeferToStaticRBAC(),
+		WithScheme(s),
 	)
 	if err != nil {
 		t.Fatalf("NewRBACScoper failed: %v", err)

@@ -169,13 +169,13 @@ if err != nil {
 // Create the scoper with constructor validation
 rbacScoper, err := rbacscope.NewRBACScoper(
     mgr.GetClient(),
-    mgr.GetScheme(),
     rbacscope.OperatorIdentity{
         Name:           os.Getenv("OPERATOR_NAME"),
         ServiceAccount: os.Getenv("OPERATOR_SA_NAME"),
         Namespace:      os.Getenv("OPERATOR_NAMESPACE"),
     },
     allowed,
+    rbacscope.WithScheme(mgr.GetScheme()),
 )
 if err != nil {
     setupLog.Error(err, "unable to create RBAC scoper")
@@ -588,13 +588,15 @@ Customize with options:
 ```go
 // Replace the entire denied list
 scoper, err := rbacscope.NewRBACScoper(
-    cl, scheme, identity, allowed,
+    cl, identity, allowed,
+    rbacscope.WithScheme(scheme),
     rbacscope.WithDeniedNamespaces("custom-system", "custom-"),
 )
 
 // Append to the defaults
 scoper, err := rbacscope.NewRBACScoper(
-    cl, scheme, identity, allowed,
+    cl, identity, allowed,
+    rbacscope.WithScheme(scheme),
     rbacscope.WithAdditionalDeniedNamespaces("istio-system"),
 )
 ```
