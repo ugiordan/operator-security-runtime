@@ -412,7 +412,7 @@ This enables generic middleware, wrappers, and testing mocks that work with eith
 
 ### Cluster-Scoped Grants (ClusterRBACScoper)
 
-For resources that require cluster-wide access (e.g., `nodes`, `namespaces`, `persistentvolumes`), `ClusterRBACScoper` manages ClusterRoles and ClusterRoleBindings. It uses annotation-based ownership exclusively because ClusterRoles are cluster-scoped and cannot have OwnerReferences pointing to namespaced resources.
+For resources that require cluster-wide access (e.g., `nodes`, `namespaces`, `persistentvolumes`), `ClusterRBACScoper` manages ClusterRoles and ClusterRoleBindings. For namespace-scoped owners, it uses annotation-based ownership because Kubernetes rejects OwnerReferences from namespace-scoped to cluster-scoped resources. For cluster-scoped owners, it uses OwnerReferences when `WithScheme` is provided (enabling native K8s garbage collection), falling back to annotations otherwise. See the ownership strategy matrix below for the complete mapping.
 
 ```mermaid
 flowchart TD
