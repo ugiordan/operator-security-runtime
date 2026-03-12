@@ -37,3 +37,8 @@ kind-cluster.yaml
 
 # Design plans (local only)
 docs/plans/
+
+# Presentation materials (local only)
+docs/PRESENTATION*.md
+docs/*.pptx
+docs/images/
