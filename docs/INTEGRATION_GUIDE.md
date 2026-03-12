@@ -280,11 +280,32 @@ func (r *YourReconciler) handleDeletion(
 }
 ```
 
-### 3.4 Watch Owned RBAC Resources
+### 3.4 Drift Recovery Model
 
-Register the controller to watch Role and RoleBinding resources owned by your
-CR. This ensures that if someone deletes or modifies the scoped RBAC resources
-externally, the controller re-reconciles and restores them:
+The `rbacscope` library uses an imperative model — it does **not** set up
+watches, informers, or controllers on the RBAC resources it creates. Every call
+to `EnsureAccess` (or `EnsureAccessInNamespace`) uses `CreateOrUpdate`, which
+is idempotent: if a Role or RoleBinding has been deleted or modified since the
+last reconcile, the next reconcile restores it to the desired state.
+
+This means drift recovery happens naturally via the caller's reconcile loop.
+Any event that triggers a reconcile for your CR (spec change, status update,
+periodic resync) will also restore any RBAC drift. For most operators, this
+eventual consistency is sufficient.
+
+**Optional immediate drift recovery:** If your use case requires detecting
+RBAC drift immediately (e.g., sub-second recovery rather than waiting for the
+next reconcile), you can register watches on the managed RBAC resources in your
+controller. The approach depends on the ownership mechanism:
+
+- **`Owns()`** — for OwnerReference-based resources (same-namespace `EnsureAccess`,
+  or `ClusterRBACScoper` with `WithScheme` and cluster-scoped owners). Simple,
+  one-line addition to your controller builder.
+- **`Watches()`** — for annotation-based resources (cross-namespace
+  `EnsureAccessInNamespace`, or `ClusterRBACScoper` without `WithScheme`).
+  Requires a custom mapping function to parse the ownership annotation.
+
+For the common case (same-namespace `RBACScoper` with `Owns()`):
 
 ```go
 func (r *YourReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -295,6 +316,14 @@ func (r *YourReconciler) SetupWithManager(mgr ctrl.Manager) error {
         Complete(r)
 }
 ```
+
+This works because `EnsureAccess` sets OwnerReferences on the Role and
+RoleBinding pointing back to your CR. Controller-runtime's `Owns()` watches
+these resources and automatically maps OwnerReference changes back to the
+owning CR, triggering a reconcile.
+
+For annotation-based resources, see the `Watches()` example with a custom
+mapping function in the example operator at `examples/operator/`.
 
 ### 3.5 Add RBAC Markers
 
@@ -874,6 +903,11 @@ externally modifies the `RoleRef` (which Kubernetes rejects) or deletes and
 recreates the `RoleBinding` with a different `RoleRef`, the scoper detects the
 `Invalid` error, deletes the stale `RoleBinding`, and recreates it with the
 correct `RoleRef`. No manual intervention is needed.
+
+More generally, all RBAC drift (deletion, rule modification, subject changes)
+is corrected by the library's idempotent `EnsureAccess`/`EnsureAccessInNamespace`
+calls on the next reconcile. For immediate drift detection, add `Owns()` watches
+on managed RBAC resources as described in Section 3.4.
 
 ### Webhook Bypassed by Mutating Webhooks
 

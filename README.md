@@ -66,6 +66,12 @@ a CR is deleted (typically via a finalizer), both scopers revoke access. The
 scopers support any combination of API groups, resources, and verbs via
 Kubernetes-native `rbacv1.PolicyRule` structs.
 
+> **Imperative, zero-overhead model:** `pkg/rbacscope` does not register any
+> watches, controllers, or informers. `EnsureAccess` and `CleanupAccess` are
+> utility functions called from your existing reconciler — the only overhead is
+> the Kubernetes API calls they make during reconciliation. See
+> [Technical Design](docs/TECHNICAL_DESIGN.md) for the full rationale.
+
 ```mermaid
 flowchart TD
     A[CR created in namespace] --> B[EnsureAccess]
@@ -247,6 +253,8 @@ if err := scoper.CleanupAccess(ctx, cr); err != nil { ... }
 not exist, or updates them if the configuration has changed. `CleanupAccess`
 removes the owner's OwnerReference and deletes the resources when no owners
 remain. Call it from your finalizer logic before removing the finalizer.
+No background goroutines, watches, or controllers are started — the scoper is
+a stateless helper whose cost is exactly the API calls shown above.
 
 For **cross-namespace** access (e.g., accessing resources in a different
 namespace than the CR's own namespace):

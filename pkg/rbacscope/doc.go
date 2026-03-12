@@ -26,6 +26,15 @@
 // entries for owners that no longer exist. It accepts an OwnerResolver callback
 // and returns a GCResult with scan statistics.
 //
+// Both scopers follow an imperative execution model: they do not set up watches,
+// controllers, or informers on the RBAC resources they manage. The caller's
+// reconciler must explicitly invoke EnsureAccess and CleanupAccess at the
+// appropriate lifecycle points. This keeps the library free of background
+// goroutines and gives the calling operator full control over when RBAC
+// operations occur. Callers who need immediate drift recovery can add
+// Owns(&rbacv1.Role{}) to their controller builder — a standard
+// controller-runtime pattern that the library does not impose.
+//
 // Both scopers satisfy the AccessScoper interface, which provides EnsureAccess,
 // CleanupAccess, and GarbageCollectOrphanedOwners. This enables generic middleware,
 // wrappers, and testing mocks that work with either scoper type.

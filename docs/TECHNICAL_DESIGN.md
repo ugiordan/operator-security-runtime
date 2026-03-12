@@ -586,6 +586,43 @@ The `roleRef` field on a RoleBinding is immutable in Kubernetes. If an external 
 
 **Tradeoff:** There is a brief window during recreation where no RoleBinding exists, temporarily revoking the operator's secrets access in that namespace. **Accepted** because this scenario (external mutation of operator-managed RoleBindings) is exceptional, and the window is milliseconds. The alternative (tolerating drift) would leave the operator bound to the wrong Role.
 
+### 5. Imperative Execution Model
+
+The `pkg/rbacscope` package provides utility functions (`EnsureAccess`, `CleanupAccess`) rather than controllers or reconciliation loops for managed RBAC resources. This is a deliberate architectural decision.
+
+**Why imperative over reactive (watch-based):**
+
+1. **Library boundary discipline.** A library that installs watches takes ownership of controller lifecycle concerns: registering informers with the manager, managing watch streams, handling backoff and error recovery for its own reconciliation loop. The imperative model keeps the library stateless: it receives a `client.Client`, performs API calls, and returns.
+
+2. **Composability.** Different operators have different drift-recovery requirements. The imperative model allows each caller to choose its own strategy without the library imposing a single approach.
+
+3. **Predictable resource consumption.** Watch streams and informer caches for RBAC resources consume memory proportional to the number of Roles and RoleBindings across the cluster. The imperative model performs direct API calls and holds no persistent state, keeping the library's memory footprint at zero between reconciliation cycles.
+
+**Drift recovery:** If an external actor deletes or modifies a managed Role or RoleBinding between reconciliation cycles, the drift persists until the next reconcile. `EnsureAccess` uses `CreateOrUpdate` semantics, so the next reconcile restores the correct state idempotently.
+
+**Optional caller-side watches:** For same-namespace grants, `EnsureAccess` sets OwnerReferences on managed resources, enabling callers to opt into immediate drift recovery using controller-runtime's `Owns()`:
+
+```go
+ctrl.NewControllerManagedBy(mgr).
+    For(&v1alpha1.MyCR{}).
+    Owns(&rbacv1.Role{}).
+    Owns(&rbacv1.RoleBinding{}).
+    Complete(r)
+```
+
+For cross-namespace grants (annotation-based ownership), callers can set up `Watches()` with a custom event handler that parses the ownership annotation. This is a caller-side decision; the library does not prescribe the mapping logic.
+
+**Performance comparison:**
+
+| Dimension | Imperative (current) | Reactive (alternative) |
+|-----------|---------------------|----------------------|
+| Memory at rest | Zero | Proportional to total RBAC resources |
+| Watch streams | None from the library | One per resource type |
+| Drift recovery latency | Next reconcile cycle | Immediate (watch event) |
+| Scalability ceiling | API call rate during CR churn | Informer cache size |
+
+**Contrast with impersonationguard:** `pkg/impersonationguard` is a standard controller-runtime reconciler that watches the `system:aggregate-to-edit` ClusterRole. This is by design: that ClusterRole can be reverted by cluster upgrades at any time, independent of any CR lifecycle. rbacscope manages resources created by the operator itself, tied to CR lifecycle, so independent watching is unnecessary.
+
 ---
 
 ## 7. Demo Walkthrough
