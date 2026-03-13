@@ -35,6 +35,10 @@
 // Owns(&rbacv1.Role{}) to their controller builder — a standard
 // controller-runtime pattern that the library does not impose.
 //
+// For cross-namespace grants where Owns() does not work, use Watches() with
+// label-filtered predicates. Call ManagedLabels() on the scoper to get the
+// exact labels applied to managed resources, avoiding hardcoded strings.
+//
 // Both scopers satisfy the AccessScoper interface, which provides EnsureAccess,
 // CleanupAccess, and GarbageCollectOrphanedOwners. This enables generic middleware,
 // wrappers, and testing mocks that work with either scoper type.

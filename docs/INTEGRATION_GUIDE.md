@@ -145,6 +145,19 @@ The RBAC scoper replaces static cluster-wide resource access with dynamic,
 namespace-scoped Roles. A Role and RoleBinding are created in each namespace
 where a CR exists, and cleaned up when the last CR in that namespace is deleted.
 
+### 3.0 Consumer Responsibilities (MUST-DO)
+
+Every consumer of the rbacscope library MUST implement the following. Omitting any of these will result in security gaps or operational issues in production.
+
+| # | Responsibility | Why | Where |
+|---|---------------|-----|-------|
+| 1 | Call `EnsureAccess`/`EnsureAccessInNamespace` in the reconcile loop | Grants are created on demand, not at startup | Reconciler's `Reconcile()` method |
+| 2 | Implement finalizer with `CleanupAccess`/`CleanupAllAccess` | Without cleanup, orphaned Roles/RoleBindings persist after CR deletion | Finalizer handler |
+| 3 | Set up drift recovery watches | The library is stateless — it does NOT watch managed resources. External deletion/modification of Roles goes undetected without watches | `SetupWithManager()` |
+| 4 | Optimize with in-memory tracking | Without tracking, every reconcile makes redundant API calls (GET + conditional write per namespace) | Reconciler struct (`sync.Map` or equivalent) |
+| 5 | Handle cold start (operator restart) | In-memory tracking resets on restart; the first reconcile re-provisions all namespaces | Automatic via empty tracking on startup |
+| 6 | Schedule periodic garbage collection | Force-deleted CRs bypass finalizers, leaving orphaned RBAC resources | Leader election callback or periodic timer |
+
 ### 3.1 Initialize Scoper
 
 In `main.go`, after creating the manager:
@@ -322,8 +335,107 @@ RoleBinding pointing back to your CR. Controller-runtime's `Owns()` watches
 these resources and automatically maps OwnerReference changes back to the
 owning CR, triggering a reconcile.
 
-For annotation-based resources, see the `Watches()` example with a custom
-mapping function in the example operator at `examples/operator/`.
+For cross-namespace grants (e.g., when using `EnsureAccessInNamespace` with annotation-based ownership),
+`Owns()` cannot detect drift because the managed Roles are in different namespaces. Use `Watches()` instead:
+
+```go
+func (r *MyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    managedLabels := r.Scoper.ManagedLabels()
+
+    isManagedByScoper := func(obj client.Object) bool {
+        labels := obj.GetLabels()
+        for k, v := range managedLabels {
+            if labels[k] != v {
+                return false
+            }
+        }
+        return true
+    }
+
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&myv1.MyCR{}).
+        Watches(
+            &rbacv1.Role{},
+            handler.EnqueueRequestsFromMapFunc(r.handleScopedRBACChange),
+            builder.WithPredicates(predicate.Funcs{
+                CreateFunc:  func(e event.CreateEvent) bool { return false },
+                UpdateFunc:  func(e event.UpdateEvent) bool { return isManagedByScoper(e.ObjectNew) },
+                DeleteFunc:  func(e event.DeleteEvent) bool { return isManagedByScoper(e.Object) },
+                GenericFunc: func(e event.GenericEvent) bool { return false },
+            }),
+        ).
+        Watches(
+            &rbacv1.RoleBinding{},
+            handler.EnqueueRequestsFromMapFunc(r.handleScopedRBACChange),
+            builder.WithPredicates(predicate.Funcs{
+                CreateFunc:  func(e event.CreateEvent) bool { return false },
+                UpdateFunc:  func(e event.UpdateEvent) bool { return isManagedByScoper(e.ObjectNew) },
+                DeleteFunc:  func(e event.DeleteEvent) bool { return isManagedByScoper(e.Object) },
+                GenericFunc: func(e event.GenericEvent) bool { return false },
+            }),
+        ).
+        Complete(r)
+}
+
+func (r *MyReconciler) handleScopedRBACChange(ctx context.Context, obj client.Object) []reconcile.Request {
+    // Invalidate tracking for this namespace so next reconcile re-provisions
+    r.provisionedScopes.Delete(obj.GetNamespace())
+
+    // Find the CR(s) that should trigger reconciliation
+    // ... list your CRs and return reconcile requests ...
+}
+```
+
+#### Managed Resource Labels
+
+The library applies these standard Kubernetes labels to all managed Roles and RoleBindings:
+
+| Label | Value | Purpose |
+|-------|-------|---------|
+| `app.kubernetes.io/managed-by` | `<OperatorIdentity.Name>` | Identifies which operator owns the resource |
+| `app.kubernetes.io/component` | `rbac-scoper` (namespace-scoped) or `cluster-rbac-scoper` (cluster-scoped) | Distinguishes scoper-managed RBAC from other RBAC |
+
+Use `scoper.ManagedLabels()` to get these labels programmatically. Example watch predicate:
+
+```go
+managedLabels := scoper.ManagedLabels()
+
+isManagedByScoper := func(obj client.Object) bool {
+    labels := obj.GetLabels()
+    for k, v := range managedLabels {
+        if labels[k] != v {
+            return false
+        }
+    }
+    return true
+}
+
+// In SetupWithManager:
+builder.Watches(
+    &rbacv1.Role{},
+    handler.EnqueueRequestsFromMapFunc(watchHandler),
+    builder.WithPredicates(predicate.Funcs{
+        CreateFunc:  func(e event.CreateEvent) bool { return false },
+        UpdateFunc:  func(e event.UpdateEvent) bool { return isManagedByScoper(e.ObjectNew) },
+        DeleteFunc:  func(e event.DeleteEvent) bool { return isManagedByScoper(e.Object) },
+        GenericFunc: func(e event.GenericEvent) bool { return false },
+    }),
+)
+```
+
+#### Cold Start / Operator Restart
+
+On operator restart, the in-memory tracking (e.g., `sync.Map`) is empty. This is the correct and expected behavior:
+
+1. The controller-runtime informer performs an initial List for all watched resources
+2. This triggers reconciliation for every existing CR
+3. Each reconcile calls `EnsureAccess`, which uses `CreateOrUpdate` internally
+4. `CreateOrUpdate` performs a GET and only writes if the resource differs — a no-op if RBAC is already correct
+5. After the first reconcile per namespace, the tracking is populated and subsequent reconciles skip the API call
+
+**Cost**: One GET per managed resource per namespace on startup. For 4 namespaces, that's ~8 API calls total — negligible.
+
+**If a Role was deleted while the operator was down**: The GET returns NotFound, `CreateOrUpdate` creates it, and RBAC is restored automatically.
 
 ### 3.5 Add RBAC Markers
 

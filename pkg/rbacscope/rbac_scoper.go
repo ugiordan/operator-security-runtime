@@ -73,8 +73,18 @@ func (s *RBACScoper) roleName() string {
 	return fmt.Sprintf("%s-scoped-access", s.operatorName)
 }
 
+// RoleName returns the name of the Role created by this scoper in each namespace.
+func (s *RBACScoper) RoleName() string {
+	return s.roleName()
+}
+
 func (s *RBACScoper) roleBindingName() string {
 	return fmt.Sprintf("%s-scoped-access-binding", s.operatorName)
+}
+
+// RoleBindingName returns the name of the RoleBinding created by this scoper in each namespace.
+func (s *RBACScoper) RoleBindingName() string {
+	return s.roleBindingName()
 }
 
 func (s *RBACScoper) labels() map[string]string {
@@ -82,6 +92,13 @@ func (s *RBACScoper) labels() map[string]string {
 		"app.kubernetes.io/managed-by": s.operatorName,
 		"app.kubernetes.io/component":  "rbac-scoper",
 	}
+}
+
+// ManagedLabels returns the labels applied to all resources managed by this scoper.
+// Use these labels to build watch predicates for drift recovery.
+// Each call returns a fresh map that is safe to modify.
+func (s *RBACScoper) ManagedLabels() map[string]string {
+	return s.labels()
 }
 
 // EnsureAccess creates or updates a Role and RoleBinding in the owner's

@@ -85,8 +85,18 @@ func (s *ClusterRBACScoper) clusterRoleName() string {
 	return fmt.Sprintf("%s-cluster-scoped-access", s.operatorName)
 }
 
+// ClusterRoleName returns the name of the ClusterRole created by this scoper.
+func (s *ClusterRBACScoper) ClusterRoleName() string {
+	return s.clusterRoleName()
+}
+
 func (s *ClusterRBACScoper) clusterRoleBindingName() string {
 	return fmt.Sprintf("%s-cluster-scoped-access-binding", s.operatorName)
+}
+
+// ClusterRoleBindingName returns the name of the ClusterRoleBinding created by this scoper.
+func (s *ClusterRBACScoper) ClusterRoleBindingName() string {
+	return s.clusterRoleBindingName()
 }
 
 func (s *ClusterRBACScoper) labels() map[string]string {
@@ -94,6 +104,13 @@ func (s *ClusterRBACScoper) labels() map[string]string {
 		"app.kubernetes.io/managed-by": s.operatorName,
 		"app.kubernetes.io/component":  "cluster-rbac-scoper",
 	}
+}
+
+// ManagedLabels returns the labels applied to all resources managed by this scoper.
+// Use these labels to build watch predicates for drift recovery.
+// Each call returns a fresh map that is safe to modify.
+func (s *ClusterRBACScoper) ManagedLabels() map[string]string {
+	return s.labels()
 }
 
 // ownershipFn returns the appropriate ownership function for the given owner.

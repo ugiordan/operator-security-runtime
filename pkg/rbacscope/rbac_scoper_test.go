@@ -2928,3 +2928,48 @@ func TestConcurrentEnsureAccess(t *testing.T) {
 		t.Errorf("expected 0 errors from concurrent CleanupAccess, got %d", c)
 	}
 }
+
+func TestRBACScoper_ManagedLabels(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, cl)
+
+	labels := scoper.ManagedLabels()
+
+	if got := labels["app.kubernetes.io/managed-by"]; got != "test-operator" {
+		t.Errorf("expected managed-by label 'test-operator', got %q", got)
+	}
+	if got := labels["app.kubernetes.io/component"]; got != "rbac-scoper" {
+		t.Errorf("expected component label 'rbac-scoper', got %q", got)
+	}
+	if len(labels) != 2 {
+		t.Errorf("expected 2 labels, got %d", len(labels))
+	}
+
+	// Verify returned map is a fresh copy (mutations don't affect scoper)
+	labels["extra"] = "value"
+	labels2 := scoper.ManagedLabels()
+	if len(labels2) != 2 {
+		t.Errorf("expected 2 labels after mutation of previous copy, got %d", len(labels2))
+	}
+}
+
+func TestRBACScoper_RoleName(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, cl)
+
+	if got := scoper.RoleName(); got != "test-operator-scoped-access" {
+		t.Errorf("expected 'test-operator-scoped-access', got %q", got)
+	}
+}
+
+func TestRBACScoper_RoleBindingName(t *testing.T) {
+	s := testScheme()
+	cl := fake.NewClientBuilder().WithScheme(s)
+	scoper := newTestScoper(t, s, cl)
+
+	if got := scoper.RoleBindingName(); got != "test-operator-scoped-access-binding" {
+		t.Errorf("expected 'test-operator-scoped-access-binding', got %q", got)
+	}
+}
